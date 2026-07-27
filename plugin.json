@@ -1,0 +1,103 @@
+{
+  "name": "Distalker",
+  "version": "0.9.1",
+  "description": "Stalker/MAG portal support for Dispatcharr. Syncs portal channels into a native M3U account and resolves short-lived stream links at tune time -- no extra containers, no extra ports.",
+  "author": "PiloUnk",
+  "license": "MIT",
+  "repo_url": "https://github.com/PiloUnk/distalker",
+  "help_url": "https://github.com/PiloUnk/distalker#readme",
+  "fields": [
+    {
+      "id": "how_info",
+      "label": "One line per portal",
+      "type": "info",
+      "description": "Write your portals below, then press Sync in the Actions tab -- it saves this panel first, so there is no need to press Save yourself. Only what you changed is fetched: adding a portal does not re-download the ones that already work. Nothing here updates on its own, so press the refresh icon at the top of the Plugins page to read what an action reported."
+    },
+    {
+      "id": "portals",
+      "label": "Portals",
+      "type": "text",
+      "default": "",
+      "placeholder": "http://portal.example.com:8080/c/ | 00:1A:79:AA:BB:CC",
+      "help_text": "Portal URL | MAC address, one line each. The name is taken from the host, so put one in front only if you want a different label -- or if two portals share a host, which the sync will then ask you to do. Trailing key=value pairs cover the rest: username, password, max_streams, model, serial, device_id, device_id2, timezone. A line starting with '#' is ignored, which is how you suspend a portal without losing its channels. Credentials are stored unencrypted and are visible in this box."
+    },
+    {
+      "id": "status",
+      "label": "Last action",
+      "type": "text",
+      "default": "",
+      "placeholder": "Nothing has run yet.",
+      "help_text": "What the most recent action did. Overwritten every time one runs; editing it changes nothing."
+    },
+    {
+      "id": "advanced_info",
+      "label": "Advanced",
+      "type": "info",
+      "description": "Everything below has a working default and applies to every portal. You should not have to touch any of it."
+    },
+    {
+      "id": "fallback_profile",
+      "label": "Fallback stream profile",
+      "type": "string",
+      "default": "ffmpeg",
+      "placeholder": "ffmpeg",
+      "help_text": "Dispatcharr picks the stream profile per channel, not per source, so a channel that mixes a portal source with another provider's sends both to this plugin. Name the profile that should play those other sources. It must be a command profile: 'Proxy' and 'Redirect' are handled inside Dispatcharr and cannot be stood in for, so naming one falls back to a plain ffmpeg remux. Published on each Sync."
+    },
+    {
+      "id": "ffmpeg_args",
+      "label": "ffmpeg arguments",
+      "type": "text",
+      "default": "-hide_banner -loglevel error -user_agent {ua} -referer {referer} -headers {headers} -rw_timeout 10000000 -i {url} -c copy -f mpegts pipe:1",
+      "help_text": "Placeholders: {url} resolved stream, {ua} MAG user agent, {referer} portal origin, {headers} the remaining MAG headers. Must write MPEG-TS to pipe:1. Note the absence of ffmpeg's -reconnect options: they retry a portal link that has already expired, and while they do, Dispatcharr cannot tell the source is dead and will not fail over to the channel's other sources. -rw_timeout gives up on a stalled read after 10 seconds, which is what turns a frozen source into a switch to the next one."
+    },
+    {
+      "id": "portal_timeout",
+      "label": "Portal request timeout (seconds)",
+      "type": "number",
+      "default": 60,
+      "min": 5,
+      "help_text": "How long to wait for any single portal request. The channel list arrives in one response, and a busy portal can take minutes to assemble it, so raise this if Test or Sync reports a timeout. It travels with each portal, so tuning waits just as long."
+    },
+    {
+      "id": "auto_apply_profile",
+      "label": "Auto-assign the Distalker stream profile",
+      "type": "boolean",
+      "default": true,
+      "help_text": "Give a channel the Distalker profile as soon as it gains a portal stream, again after every M3U refresh, and once more if a channel ever fails to start -- which repairs any channel created while the plugin was disabled or upgrading. Dispatcharr resolves stream profiles per channel, so a channel without it will not tune its portal source. A channel that also holds sources from other providers gets the profile too -- those sources then play through the fallback profile above instead of Dispatcharr's direct relay."
+    }
+  ],
+  "actions": [
+    {
+      "id": "test_portals",
+      "label": "1. Test",
+      "description": "Authenticate against every listed portal and read its group list, which answers straight away. Changes nothing, in Dispatcharr or at the portal. Optional, but it is the cheap way to find out that a MAC is wrong -- before a download that can take minutes tells you the same thing.",
+      "button_label": "Test",
+      "button_variant": "light"
+    },
+    {
+      "id": "sync_now",
+      "label": "2. Sync",
+      "description": "Apply the portal list and fetch what changed: portals you added or edited are downloaded, ones you deleted stop resolving, and the rest are left alone. Runs in the background and reports into 'Last action', because a busy portal can take minutes to answer. From here on, this is the only button you should need.",
+      "button_label": "Sync",
+      "button_variant": "filled"
+    },
+    {
+      "id": "resync_all",
+      "label": "Re-fetch everything",
+      "description": "Download every portal's channel list again, changed or not. Sync only fetches what you edited, so this is how you pick up a line-up that changed at the provider. Slow, and it spends one connection per portal.",
+      "button_label": "Re-fetch all",
+      "button_variant": "light"
+    },
+    {
+      "id": "apply_profile",
+      "label": "Assign the stream profile",
+      "description": "Point every Distalker channel at the Distalker stream profile, without which a channel cannot tune, and republish the portals the resolver reads at tune time. Runs by itself after each M3U refresh, and again whenever a channel fails to start, unless you turned that off -- so you should rarely need this button.",
+      "button_label": "Assign",
+      "button_variant": "light",
+      "events": [
+        "m3u_refresh",
+        "channel_error"
+      ]
+    }
+  ]
+}
