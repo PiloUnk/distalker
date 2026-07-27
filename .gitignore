@@ -1,0 +1,20 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Local scratch
+*.m3u
+*.log
+.env
+
+# Editors and agent tooling. Nothing under .claude/ belongs in a published
+# plugin, and some of it is local-only configuration.
+.idea/
+.vscode/
+.DS_Store
+.claude/
+
+# Build output
+dist/
