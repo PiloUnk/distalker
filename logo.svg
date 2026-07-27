@@ -1,0 +1,42 @@
+<!--
+  Distalker plugin icon: the source logo.png is rendered from.
+
+  Dispatcharr shows this in a Mantine <Avatar radius="sm"> at 48px on the plugin
+  card and 28px in the settings modal header, so everything here is flat and
+  chunky on purpose: no gradients, no text, nothing thinner than the antennae.
+  The tile is part of the artwork rather than a backdrop, because a mark drawn
+  on transparency loses its dark parts on the plugins page and its light parts
+  in a light theme.
+
+  Regenerate the PNG after editing:
+    python3 -c "import cairosvg; cairosvg.svg2png(url='logo.svg',
+      write_to='logo.png', output_width=512, output_height=512)"
+-->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <rect width="512" height="512" rx="104" fill="#151020"/>
+
+  <!-- The line-up arriving from the portal. Three thick strokes rather than the
+       five stepped ones of the wordmark: at 28px, more would silt up. -->
+  <g stroke="#8B5CF6" stroke-width="30" stroke-linecap="round">
+    <path d="M 74 236 L 146 236"/>
+    <path d="M 40 300 L 146 300"/>
+    <path d="M 74 364 L 146 364"/>
+  </g>
+
+  <g transform="translate(44,0)">
+    <g stroke="#8B5CF6" stroke-width="26" stroke-linecap="round" fill="none">
+      <path d="M 226 178 L 186 106"/>
+      <path d="M 286 178 L 326 106"/>
+    </g>
+    <circle cx="182" cy="98" r="19" fill="#8B5CF6"/>
+    <circle cx="330" cy="98" r="19" fill="#8B5CF6"/>
+    <rect x="176" y="396" width="34" height="34" rx="12" fill="#8B5CF6"/>
+    <rect x="302" y="396" width="34" height="34" rx="12" fill="#8B5CF6"/>
+    <rect x="122" y="180" width="268" height="228" rx="42" fill="#8B5CF6"/>
+    <!-- Lighter than the tile on purpose: at 28px an unlit screen merges with
+         it and leaves the play mark floating in a violet outline. -->
+    <rect x="158" y="216" width="196" height="156" rx="22" fill="#2A1F47"/>
+    <path d="M 228 254 L 306 294 L 228 334 Z" fill="#FFFFFF"
+          stroke="#FFFFFF" stroke-width="16" stroke-linejoin="round"/>
+  </g>
+</svg>
