@@ -1,0 +1,83 @@
+name: Release
+
+# Tag a release and the importable ZIP is attached to it automatically:
+#
+#   git tag v0.1.0 && git push origin v0.1.0
+#
+# The resulting asset URL is stable and version-templated, which is the shape
+# the Dispatcharr plugin registry expects for an "external" plugin listing:
+#   https://github.com/<owner>/distalker/releases/download/v{version}/distalker-{version}.zip
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+
+      - name: Check the tag matches plugin.json
+        run: |
+          manifest=$(python3 -c "import json; print(json.load(open('plugin.json'))['version'])")
+          tag="${GITHUB_REF_NAME#v}"
+          if [ "$manifest" != "$tag" ]; then
+            echo "::error::tag v$tag does not match plugin.json version $manifest"
+            exit 1
+          fi
+          echo "version $manifest"
+
+      # Held to the same rule as the version above: a release with no changelog
+      # entry does not happen. A changelog nobody is obliged to write is a
+      # changelog that stops being written, and the reader of a release page
+      # deserves better than a list of commit subjects.
+      - name: Take the release notes from CHANGELOG.md
+        run: |
+          python3 - "${GITHUB_REF_NAME#v}" <<'PY' > release-notes.md
+          import re, sys
+
+          version = sys.argv[1]
+          text = open("CHANGELOG.md", encoding="utf-8").read()
+          section = re.search(
+              rf"^## {re.escape(version)}\b[^\n]*\n(.*?)(?=^## |\Z)",
+              text, re.M | re.S,
+          )
+          if section is None or not section.group(1).strip():
+              sys.exit(f"CHANGELOG.md has no entry for {version}")
+          print(section.group(1).strip())
+          PY
+
+      - name: Install test dependencies
+        run: pip install --quiet requests redis celery
+
+      # Every file, found rather than listed: this list was written when there
+      # were four of them and had silently stopped covering half the suite --
+      # including the tests for the panel and for surviving an emptied Redis.
+      # ci.yml names each one, because that is where you look when something
+      # fails; here the only question is whether anything is broken at all.
+      - name: Run every test
+        run: |
+          for test in tests/test_*.py; do
+            echo "--- $test"
+            python3 "$test"
+          done
+
+      - name: Build the plugin ZIP
+        run: ./build.sh
+
+      # The changelog entry is the body; GitHub's generated list of commits is
+      # appended under it, for whoever wants the detail behind the summary.
+      - uses: softprops/action-gh-release@v3
+        with:
+          files: dist/*.zip
+          body_path: release-notes.md
+          generate_release_notes: true
