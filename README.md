@@ -227,7 +227,7 @@ You should not need any of these.
 | --- | --- | --- |
 | ffmpeg arguments | a plain remux, plus the MAG headers and `-rw_timeout` | Placeholders `{url}`, `{ua}`, `{referer}`, `{headers}`. Must write MPEG-TS to `pipe:1`. **Do not add `-reconnect`** — it retries a link that has already expired, and stops Dispatcharr failing over to the channel's other sources. |
 | Fallback stream profile | `ffmpeg` | Plays the *other* sources on a Distalker channel — see below. |
-| Portal request timeout | `60` s | Every portal request, sync and tune alike. Raise it if a busy portal times out assembling its channel list. |
+| Portal request timeout | `60` s | Every portal request, sync and tune alike. Raise it if a busy portal times out assembling its channel list. A sync retries twice on top of this — 1 s then 2 s apart — so raising it far also lengthens the worst case of a failing sync. |
 | Auto-assign stream profile | on | Gives a channel the Distalker profile as it gains a portal stream, after each M3U refresh, and once more after any channel fails to start. |
 
 ### Channels that mix a portal with another provider

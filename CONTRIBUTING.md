@@ -34,6 +34,7 @@ script with its own `__main__` block:
 ```bash
 python3 tests/test_config.py       # portal-line parsing, STB defaults, pseudo-URLs
 python3 tests/test_auth.py         # which authentication a portal asks for
+python3 tests/test_transport.py    # what a request carries, and when it is retried
 python3 tests/test_registry.py     # surviving the settings panel
 python3 tests/test_manifest.py     # plugin.json vs plugin.py, and run()'s plumbing
 python3 tests/test_fallback.py     # non-portal sources on a Distalker channel

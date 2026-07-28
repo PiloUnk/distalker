@@ -150,6 +150,12 @@ def main():
     assert "mac=00%3A1A%3A79%3AAA%3ABB%3ACC" in by_action["get_all_channels"]["Cookie"]
     print("headers (UA / Bearer / MAC cookie): OK")
 
+    # The identity reaches a real socket in both forms, not just in the
+    # headers a unit test can inspect.
+    content = [p for _, a, _, p in seen_requests if a == "get_all_channels"][0]
+    assert content["mac"] == ["00:1A:79:AA:BB:CC"], content
+    assert content["token"] == ["TESTTOKEN123"], content
+
     # The portal asked for credentials and got them, in the right order.
     actions = [a for _, a, _, _ in seen_requests]
     assert actions[:4] == ["handshake", "get_profile", "do_auth", "get_profile"], actions

@@ -26,6 +26,7 @@ import shlex
 import shutil
 import sys
 import tempfile
+import time
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
@@ -69,6 +70,23 @@ STB_NUM_BANKS = 1
 # the token it was given is no longer good. Matched exactly because it is a
 # fixed string in Ministra rather than something a reseller writes.
 AUTH_FAILED_BODY = "authorization failed."
+
+# Answers worth asking again for. Everything else is the portal having made up
+# its mind: a 404 is not going to become a 200, and a 403 is the subject of
+# PortalAuthError, which must never be retried -- repeating a rejected login is
+# how a MAC gets itself banned.
+#
+# 500 is in the list and is the debatable one. Ministra returns it both for
+# "busy right now" and for some permanent failures, so a third of these retries
+# will be spent on something that cannot succeed. Three attempts is a small
+# enough bill for covering the transient half.
+RETRYABLE_STATUS = frozenset({429, 500, 502, 503, 504})
+
+# Seconds before the 1st, 2nd and 3rd retry. Fixed rather than jittered: the
+# calls that retry are made one portal at a time from a single process, so
+# there is no herd to spread out, and a deterministic delay is one a test can
+# assert on.
+RETRY_BACKOFF = (1.0, 2.0, 4.0)
 
 # Seconds to wait on any single portal request. Generous by HTTP standards
 # because get_all_channels is one request for the entire line-up, and a busy
@@ -937,12 +955,26 @@ class Portal:
     and skip the handshake.
     """
 
-    def __init__(self, cfg: PortalConfig, token: str = "", timeout: Optional[int] = None):
+    def __init__(
+        self,
+        cfg: PortalConfig,
+        token: str = "",
+        timeout: Optional[int] = None,
+        retries: int = 0,
+    ):
         self.cfg = cfg
         self.token = token
         # The portal's own setting unless a caller insists, so every request
         # made about a portal honours what the user configured for it.
         self.timeout = timeout or getattr(cfg, "timeout", None) or DEFAULT_TIMEOUT
+        # Retrying is the caller's decision, not this class's, and it defaults
+        # to off because the caller that matters most must not have it. At tune
+        # time a portal that is not answering has to fail *now*: the resolver's
+        # only job on a bad source is to exit non-zero fast enough that
+        # Dispatcharr moves to the next one -- the same reasoning that keeps
+        # ffmpeg's -reconnect out of the default arguments. A sync has the
+        # opposite need, and asks for retries explicitly.
+        self.retries = max(0, int(retries))
         self.session = requests.Session()
         # Non-fatal notes from login(), for the caller to surface.
         self.warnings: List[str] = []
@@ -985,14 +1017,51 @@ class Portal:
             headers["Authorization"] = "Bearer " + self.token
         return headers
 
+    def _common_params(self, with_auth: bool = True) -> str:
+        """Identity repeated in the query string, beside the cookie and header.
+
+        Belt and braces, and cheap. The MAC travels in a cookie and the token in
+        an Authorization header because that is what a MAG box does and what
+        Ministra reads -- but plenty of what this plugin meets are not Ministra,
+        and open-tv authenticates against real portals using *only* these two
+        query parameters, with no cookie and no header at all. Sending both
+        forms covers portals that read either, and no portal has been seen to
+        mind the one it ignores.
+        """
+        params = f"mac={quote(self.cfg.mac)}"
+        if with_auth and self.token:
+            params += f"&token={quote(self.token)}"
+        return params
+
+    def _request(self, method: str, url: str, **kwargs) -> requests.Response:
+        """One portal request, repeated only while repeating it could help.
+
+        Returns the response for the caller to interpret, including a final
+        failing one: deciding what an HTTP 404 means is :meth:`_get_json`'s job,
+        not this one's. Only exhausting the attempts without ever getting an
+        answer raises here.
+        """
+        last_error = ""
+        for attempt in range(self.retries + 1):
+            if attempt:
+                time.sleep(RETRY_BACKOFF[min(attempt, len(RETRY_BACKOFF)) - 1])
+            try:
+                resp = self.session.request(
+                    method, url, timeout=self.timeout, **kwargs
+                )
+            except requests.RequestException as exc:
+                last_error = f"request to portal failed: {exc}"
+                continue
+            if resp.status_code in RETRYABLE_STATUS and attempt < self.retries:
+                last_error = f"portal returned HTTP {resp.status_code}"
+                continue
+            return resp
+
+        raise PortalError(last_error or "request to portal failed")
+
     def _get_json(self, query: str, with_auth: bool = True) -> Any:
-        url = f"{self.cfg.url}?{query}"
-        try:
-            resp = self.session.get(
-                url, headers=self._headers(with_auth), timeout=self.timeout
-            )
-        except requests.RequestException as exc:
-            raise PortalError(f"request to portal failed: {exc}") from exc
+        url = f"{self.cfg.url}?{query}&{self._common_params(with_auth)}"
+        resp = self._request("GET", url, headers=self._headers(with_auth))
 
         if resp.status_code in (401, 403):
             raise PortalAuthError(
@@ -1055,18 +1124,18 @@ class Portal:
         }
         headers = self._headers()
         headers["Content-Type"] = "application/x-www-form-urlencoded"
+        url = f"{self.cfg.url}?{self._common_params()}"
+        resp = self._request("POST", url, data=form, headers=headers)
+
         try:
-            resp = self.session.post(
-                self.cfg.url, data=form, headers=headers, timeout=self.timeout
-            )
             payload = resp.json()
-        except requests.RequestException as exc:
-            raise PortalError(f"authentication request failed: {exc}") from exc
         except ValueError:
             raise PortalError("authentication returned a non-JSON response")
 
         if not payload.get("js"):
-            raise PortalError(payload.get("text") or "invalid credentials")
+            # The portal read the credentials and said no. Not retryable, and
+            # not the same failure as never having reached it.
+            raise PortalAuthError(payload.get("text") or "invalid credentials")
 
     def get_profile(self, auth_second_step: bool = False) -> Dict[str, Any]:
         """Present the box to the portal and read back what it makes of it.

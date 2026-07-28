@@ -407,9 +407,21 @@ def apply_stream_profile() -> Dict[str, int]:
 # ---------------------------------------------------------------------------
 
 
+# Three attempts at anything a sync asks the portal for. A provider that
+# hiccups once should not cost the user their whole line-up until the next
+# scheduled run, and a sync has the time -- nothing is waiting on it.
+#
+# Worst case per call is (retries + 1) x timeout plus the backoff, so 187s at
+# the default 60s timeout. Portals are synced one after another under a lock
+# that expires after 1800s (see claim_sync_lock): raising either number far
+# enough that a run could outlive its own lock would let a second run start on
+# top of the first.
+SYNC_RETRIES = 2
+
+
 def sync_portal(cfg: PortalConfig, logger, trigger_refresh: bool = True) -> Dict[str, Any]:
     """Full sync for one portal: log in, fetch, write M3U, refresh account."""
-    portal = Portal(cfg)
+    portal = Portal(cfg, retries=SYNC_RETRIES)
     portal.login()
     for warning in portal.warnings:
         logger.warning("distalker: %s: %s", cfg.name, warning)
@@ -485,6 +497,12 @@ def test_portal(cfg: PortalConfig) -> Dict[str, Any]:
     and Dispatcharr comes back as a 504. Genres are a short list and prove the
     same thing -- that the MAC authenticates and the session works. The channel
     count comes from a sync, which no longer blocks a request.
+
+    Retries are off here for the same reason, and deliberately not shared with
+    :data:`SYNC_RETRIES`: three attempts at a 60-second timeout is three minutes
+    of a request thread, and the proxy in front of Dispatcharr gives up long
+    before that. A portal that needs a second attempt to answer is a portal
+    this action should report as unwell, not one it should wait out.
     """
     portal = Portal(cfg)
     portal.login()

@@ -29,6 +29,23 @@
 - The `device_id_auth` line key is gone. Nothing needs to be changed: it was
   never something to write on a portal line, only a value the plugin derived
   for itself, and lines are re-read on every sync.
+- The MAC and the session token now travel in the query string as well as in
+  the cookie and the `Authorization` header. Portals read one form or the
+  other, and sending both costs nothing.
+
+**Syncing**
+
+- **A sync survives a portal having a bad minute.** Requests made while
+  syncing are attempted up to three times, one then two then four seconds
+  apart, where a single dropped connection or gateway error used to cost the
+  whole line-up until the next scheduled run. Only failures that another
+  attempt could fix are repeated: a refused login, a blocked account or a
+  missing endpoint still fails immediately.
+- Nothing is retried at tune time, deliberately. A source that is not answering
+  has to fail fast enough for Dispatcharr to move to the next one, which is the
+  same reason `-reconnect` is not in the default ffmpeg arguments. "Test
+  portals" does not retry either — it answers a click, and three attempts at
+  the portal timeout outlast the browser waiting for it.
 
 ## 0.9.2
 

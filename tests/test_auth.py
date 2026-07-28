@@ -206,7 +206,7 @@ def test_a_dead_session_in_plain_text_is_an_auth_error():
     cfg = s.PortalConfig(slug="t", name="T", url="http://p.example/c/portal.php",
                          mac="00:1A:79:AA:BB:CC")
     p = s.Portal(cfg)
-    p.session.get = lambda *a, **k: FakeResponse()
+    p.session.request = lambda *a, **k: FakeResponse()
     try:
         p._get_json("action=get_all_channels")
     except s.PortalAuthError as exc:
