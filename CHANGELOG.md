@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.9.2
 
 **Playing**
 
@@ -11,6 +11,11 @@
   `-loglevel info -stats`, and is replaced on installs still carrying the old
   one, unless you wrote your own. Sources played through the fallback command
   report the same way.
+
+**Developing**
+
+- `./build.sh -dev` packs the working tree into `dist/distalker-dev.zip`, for
+  trying a change on a real install before committing it.
 
 **Licence**
 

@@ -1,6 +1,6 @@
 {
   "name": "Distalker",
-  "version": "0.9.1",
+  "version": "0.9.2",
   "description": "Stalker/MAG portal support for Dispatcharr. Syncs portal channels into a native M3U account and resolves short-lived stream links at tune time -- no extra containers, no extra ports.",
   "author": "PiloUnk",
   "license": "AGPL-3.0-only",
