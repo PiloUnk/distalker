@@ -46,6 +46,30 @@ DEFAULT_DEVICE_ID = "f" * 64
 DEFAULT_SIGNATURE = "f" * 64
 DEFAULT_TIMEZONE = "UTC"
 
+# The rest of what a MAG box tells get_profile about itself. Fixed rather than
+# configurable: these describe a firmware image, not an account, and a portal
+# that cared would want them to agree with each other -- which they only do as
+# the block libstalkerclient has been sending since 2015 (lib/libstalkerclient/
+# stb.c, `sc_stb_get_profile_defaults`). They describe a MAG250 image even when
+# stb_type says MAG254; no portal has ever been seen to cross-check the two,
+# and every Stalker client in the wild sends this same mismatch.
+STB_VERSION = (
+    "ImageDescription: 0.2.16-250; "
+    "ImageDate: 18 Mar 2013 19:56:53 GMT+0200; "
+    "PORTAL version: 4.9.9; "
+    "API Version: JS API version: 328; "
+    "STB API version: 134; "
+    "Player Engine version: 0x566"
+)
+STB_IMAGE_VERSION = 216
+STB_HW_VERSION = "1.7-BD-00"
+STB_NUM_BANKS = 1
+
+# What a portal answers with, in plain text and with no JSON around it, once
+# the token it was given is no longer good. Matched exactly because it is a
+# fixed string in Ministra rather than something a reseller writes.
+AUTH_FAILED_BODY = "authorization failed."
+
 # Seconds to wait on any single portal request. Generous by HTTP standards
 # because get_all_channels is one request for the entire line-up, and a busy
 # portal can take minutes to assemble it.
@@ -148,6 +172,17 @@ class PortalError(Exception):
     """Raised when the portal rejects us or answers with nonsense."""
 
 
+class PortalAuthError(PortalError):
+    """The portal understood us and refused the session.
+
+    Separated from its parent because the two want opposite handling: a
+    transport failure is worth retrying, an account the portal has declined is
+    not, and only the second is worth repeating verbatim to the user -- the
+    portal's own wording ("blocked", "subscription expired") says more than
+    anything this plugin could infer.
+    """
+
+
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
@@ -168,11 +203,7 @@ class PortalConfig:
     serial_number: str = DEFAULT_SERIAL
     model: str = DEFAULT_MODEL
     timezone: str = DEFAULT_TIMEZONE
-    # Accepted for parity with stalkerhek's profile settings. stalkerhek only
-    # ever sends it from its STB proxy mode (proxy/proxy.go); none of the
-    # handshake / auth / create_link requests this plugin makes include it.
     signature: str = DEFAULT_SIGNATURE
-    device_id_auth: bool = False
     max_streams: int = 1
     ffmpeg_args: str = DEFAULT_FFMPEG_ARGS
     # Travels to Redis with the rest, so the resolver waits as long as the sync
@@ -443,12 +474,6 @@ def parse_portals(text: str) -> Tuple[List[PortalConfig], List[str]]:
             timezone=timezone,
             signature=signature,
             max_streams=max_streams,
-            # Absence of credentials selects device-ID auth, exactly as
-            # stalkerhek does (`deviceIdAuth := pd.Username == "" &&
-            # pd.Password == ""` in webui/profiles.go). The default ffff...
-            # IDs are what a MAC-only portal expects, so this fires even when
-            # the user supplied no IDs of their own.
-            device_id_auth=not (username and password),
         )
         portals.append(cfg)
 
@@ -921,6 +946,17 @@ class Portal:
         self.session = requests.Session()
         # Non-fatal notes from login(), for the caller to surface.
         self.warnings: List[str] = []
+        # Whether the portal said the token it handed back is already good for
+        # more than the handshake. Reported straight back to it in get_profile.
+        self.valid_token = False
+        # What get_profile answered during login(), kept so nothing has to ask
+        # twice: the expiry report and the blocked flag both read it.
+        self.profile: Dict[str, Any] = {}
+        # Which flow login() ended up taking, for the "Test portals" report.
+        # Worth saying out loud: it is the portal's choice, not the user's, so
+        # it is the one thing that tells them whether the credentials they
+        # typed in are being used at all.
+        self.auth_method = "handshake only"
 
     # -- plumbing ---------------------------------------------------------
 
@@ -958,6 +994,11 @@ class Portal:
         except requests.RequestException as exc:
             raise PortalError(f"request to portal failed: {exc}") from exc
 
+        if resp.status_code in (401, 403):
+            raise PortalAuthError(
+                f"portal refused the session (HTTP {resp.status_code})"
+            )
+
         if resp.status_code < 200 or resp.status_code >= 300:
             snippet = (resp.text or "").strip()[:300]
             raise PortalError(
@@ -969,6 +1010,11 @@ class Portal:
             return resp.json()
         except ValueError:
             snippet = (resp.text or "").strip()[:300]
+            # A dead session is answered in plain text with a 200 attached, so
+            # it arrives here rather than as an HTTP error. Saying so is what
+            # lets the resolver re-authenticate instead of failing the tune.
+            if snippet.lower() == AUTH_FAILED_BODY:
+                raise PortalAuthError("portal says the session is no longer authorised")
             raise PortalError(f"portal returned non-JSON response: {snippet}")
 
     # -- authentication ---------------------------------------------------
@@ -982,12 +1028,22 @@ class Portal:
         js = data.get("js") if isinstance(data, dict) else None
         if isinstance(js, dict) and js.get("token"):
             self.token = str(js["token"])
+            # 'not_valid' is the portal saying the token still has to be
+            # earned. get_profile is told the same thing back, which is how it
+            # knows whether it is being asked to validate or merely to report.
+            self.valid_token = str(js.get("not_valid") or "0") in ("0", "")
         if not self.token:
             raise PortalError("handshake did not yield a token")
         return self.token
 
     def authenticate(self) -> None:
-        """Associate credentials with the token (username/password portals)."""
+        """Associate credentials with the token. Run when the profile says 2.
+
+        Sent as a POST, where every other call here is a GET: pvr.stalker puts
+        the login and password in the query string, and there is no reason for
+        this plugin to write a subscriber's password into a proxy's access log
+        when the portal accepts a form body just as happily.
+        """
         form = {
             "type": "stb",
             "action": "do_auth",
@@ -1012,59 +1068,146 @@ class Portal:
         if not payload.get("js"):
             raise PortalError(payload.get("text") or "invalid credentials")
 
-    def authenticate_with_device_ids(self) -> None:
-        """Second-step auth for portals keyed on device IDs rather than login."""
-        data = self._get_json(
-            "type=stb&action=get_profile&JsHttpRequest=1-xml&hd=1"
-            f"&sn={self.cfg.serial_number}&stb_type={self.cfg.model}"
-            f"&device_id={self.cfg.device_id}&device_id2={self.cfg.device_id2}"
-            "&auth_second_step=1"
+    def get_profile(self, auth_second_step: bool = False) -> Dict[str, Any]:
+        """Present the box to the portal and read back what it makes of it.
+
+        This is the request that carries the whole STB identity, and the reply
+        is the portal stating what it wants next -- see :meth:`login`. The
+        field list is libstalkerclient's, unchanged: portals have been known to
+        reject a profile that arrives with fields missing, and the cost of
+        sending all of them is a longer query string.
+        """
+        query = (
+            "type=stb&action=get_profile&JsHttpRequest=1-xml"
+            f"&hd=1&num_banks={STB_NUM_BANKS}"
+            f"&image_version={STB_IMAGE_VERSION}&hw_version={quote(STB_HW_VERSION)}"
+            f"&ver={quote(STB_VERSION)}"
+            f"&stb_type={quote(self.cfg.model)}&sn={quote(self.cfg.serial_number)}"
+            f"&device_id={quote(self.cfg.device_id)}"
+            f"&device_id2={quote(self.cfg.device_id2)}"
+            f"&signature={quote(self.cfg.signature)}"
+            f"&not_valid_token={0 if self.valid_token else 1}"
+            f"&auth_second_step={1 if auth_second_step else 0}"
         )
+        data = self._get_json(query)
         js = data.get("js") if isinstance(data, dict) else None
-        if not isinstance(js, dict) or not js.get("id"):
-            raise PortalError(
-                (data or {}).get("text") or "device ID authentication rejected"
-            )
+        return js if isinstance(js, dict) else {}
+
+    # What get_profile's 'status' means. The portal decides which authentication
+    # this account needs and says so here, rather than the client guessing from
+    # whether a password happens to be configured.
+    _PROFILE_OK = 0
+    _PROFILE_NEEDS_AUTH = 2
 
     def login(self) -> str:
-        """Handshake plus whichever auth flow this portal needs.
+        """Handshake, then whichever authentication the portal asks for.
 
-        Credentials win when present. Otherwise the device-ID step runs, which
-        is what stalkerhek does for MAC-only portals -- but its failure is not
-        fatal here: plenty of portals authorise purely on the MAC cookie and
-        either lack ``get_profile`` or answer it without a profile id. If the
-        session really is unauthorised, the very next call fails with a far
-        more useful message than "device ID authentication rejected".
+        The portal is the one that knows::
+
+            handshake  ->  token (+ 'not_valid': is it good for anything yet?)
+            get_profile
+                status 0  ->  done
+                status 2  ->  do_auth, then get_profile(auth_second_step=1)
+                anything  ->  refused; 'block_msg'/'msg' says why
+
+        This replaces guessing the flow from whether credentials were typed in.
+        The old guess was wrong in both directions -- it ran a device-ID step
+        against portals that wanted a password, and it had no way to tell a
+        blocked account from an empty line-up.
+
+        Two deliberate departures from that state machine, both of them
+        tolerance for portals that are not really Ministra:
+
+        * a reply with no ``status`` at all counts as 0. Ministra always sends
+          one; the clones this plugin mostly meets often do not, and the
+          previous version happily served them. pvr.stalker treats the same
+          silence as a failure, which would break every one of those installs.
+        * ``get_profile`` failing to answer *at all* -- 404, a gateway error,
+          prose instead of JSON -- is a warning, not an error. Plenty of
+          portals authorise on the MAC cookie alone and never implement it. An
+          explicit refusal (:class:`PortalAuthError`) is still fatal, because
+          that is the portal answering rather than failing to.
         """
         self.handshake()
 
-        if self.cfg.username and self.cfg.password:
-            self.authenticate()
-        elif self.cfg.device_id_auth:
-            try:
-                self.authenticate_with_device_ids()
-            except PortalError as exc:
-                self.warnings.append(
-                    f"device-ID authentication did not succeed ({exc}); "
-                    "continuing with MAC-only authorisation"
+        try:
+            self.profile = self.get_profile()
+        except PortalAuthError:
+            raise
+        except PortalError as exc:
+            self.warnings.append(
+                f"the portal did not answer get_profile ({exc}); "
+                "continuing with MAC-only authorisation"
+            )
+            return self.token
+
+        status = self._profile_status(self.profile)
+        self.auth_method = "profile"
+
+        if status == self._PROFILE_NEEDS_AUTH:
+            if not (self.cfg.username and self.cfg.password):
+                raise PortalAuthError(
+                    self._profile_message(self.profile)
+                    or "this portal wants a username and password; add "
+                    "'username=... password=...' to its line"
                 )
+            self.authenticate()
+            self.profile = self.get_profile(auth_second_step=True)
+            status = self._profile_status(self.profile)
+            self.auth_method = "credentials"
+
+        if status != self._PROFILE_OK:
+            raise PortalAuthError(
+                self._profile_message(self.profile)
+                or f"portal refused the session (status {status})"
+            )
 
         return self.token
+
+    @staticmethod
+    def _profile_status(profile: Dict[str, Any]) -> int:
+        """``status`` as an int. Absent, blank or unparseable all mean OK."""
+        raw = profile.get("status")
+        if raw is None or raw == "":
+            return Portal._PROFILE_OK
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            return Portal._PROFILE_OK
+
+    @staticmethod
+    def _profile_message(profile: Dict[str, Any]) -> str:
+        """The portal's own explanation, if it gave one.
+
+        ``block_msg`` first: when both are set it is the specific one, and it
+        is what the reseller wrote for exactly this situation.
+        """
+        for key in ("block_msg", "msg"):
+            value = str(profile.get(key) or "").strip()
+            if value:
+                return value
+        return ""
 
     def account_snapshot(self) -> Dict[str, Any]:
         """What the portal will say about the subscription itself.
 
-        Two calls, both made once per sync and never at tune time. Neither is
-        required for anything to work, so this returns what it managed to read
-        and never raises.
+        One call, made once per sync and never at tune time. Not required for
+        anything to work, so this returns what it managed to read and never
+        raises.
 
         ``get_main_info`` is where resellers put the expiry date: Ministra shows
         the ``phone`` field in the MAG interface, so that is the field they fill
         in with it -- observed on every portal tested, in the form
-        "August 18, 2027, 4:53 pm". ``get_profile`` carries ``blocked``, which
-        turns "nothing plays and I do not know why" into one line of the report.
+        "August 18, 2027, 4:53 pm".
 
-        No connection limit is available from either: neither ``max_online`` nor
+        ``blocked`` comes from the profile :meth:`login` already read, rather
+        than from a second ``get_profile``. It is nearly always redundant now --
+        a blocked account normally answers with a non-zero ``status``, which
+        login refuses outright -- but portals that set the flag and leave the
+        status at 0 exist, and for those it is still the only warning anyone
+        gets.
+
+        No connection limit is available anywhere: neither ``max_online`` nor
         an equivalent exists in the responses, and ``playback_limit`` is a
         portal-wide Ministra default (3 on unrelated providers, next to
         ``tv_playback_retry_limit`` = 3), not this account's allowance. Guessing
@@ -1081,14 +1224,7 @@ class Portal:
         except Exception:
             pass
 
-        try:
-            js = self._get_json(
-                "type=stb&action=get_profile&hd=1&JsHttpRequest=1-xml"
-            ).get("js")
-            if isinstance(js, dict):
-                snapshot["blocked"] = str(js.get("blocked") or "0") not in ("0", "")
-        except Exception:
-            pass
+        snapshot["blocked"] = str(self.profile.get("blocked") or "0") not in ("0", "")
 
         return snapshot
 
@@ -1160,12 +1296,21 @@ class Portal:
             f"action=create_link&type=itv&cmd={quote(cmd, safe='')}&JsHttpRequest=1-xml"
         )
         js = data.get("js") if isinstance(data, dict) else None
+        # Typed as auth failures, both of them, because that is overwhelmingly
+        # what they are: a portal whose token has expired usually answers
+        # create_link with a hollow success -- 'js' false, or a 'cmd' that is
+        # empty -- rather than with the plain-text refusal. The resolver only
+        # re-authenticates on this class, so mistyping these would leave the
+        # cached-token path unable to recover from the very thing it exists
+        # for. The cost of being wrong is one handshake.
         if not isinstance(js, dict):
-            raise PortalError("create_link returned no data (session may have expired)")
+            raise PortalAuthError(
+                "create_link returned no data (session may have expired)"
+            )
 
         raw = str(js.get("cmd") or "").strip()
         if not raw:
-            raise PortalError("create_link returned an empty command")
+            raise PortalAuthError("create_link returned an empty command")
 
         link = extract_link(raw)
         if not link:

@@ -32,14 +32,19 @@ class PortalHandler(BaseHTTPRequestHandler):
 
     def _handle(self, params, method):
         action = params.get("action", [""])[0]
-        seen_requests.append((method, action, dict(self.headers)))
+        seen_requests.append((method, action, dict(self.headers), params))
 
         if action == "handshake":
-            return self._reply({"js": {"token": "TESTTOKEN123", "not_valid": 0}})
+            return self._reply({"js": {"token": "TESTTOKEN123", "not_valid": 1}})
         if action == "do_auth":
             return self._reply({"js": True, "text": "authenticated"})
         if action == "get_profile":
-            return self._reply({"js": {"id": 42, "fname": "Test User"}})
+            # A portal that wants credentials: status 2 until do_auth has run
+            # and get_profile comes back with auth_second_step=1. This is the
+            # full state machine login() implements.
+            if params.get("auth_second_step", ["0"])[0] == "1":
+                return self._reply({"js": {"id": 42, "fname": "Test User", "status": 0}})
+            return self._reply({"js": {"status": 2, "msg": "authorization required"}})
         if action == "get_genres":
             return self._reply({"js": [
                 {"id": "1", "title": "FR| SPORT"},
@@ -138,12 +143,31 @@ def main():
     print("pseudo-URL round-trip through the playlist: OK")
 
     # Auth header must be present on content calls but absent on handshake.
-    by_action = {a: h for _, a, h in seen_requests}
+    by_action = {a: h for _, a, h, _ in seen_requests}
     assert "Authorization" not in by_action["handshake"], "handshake must not send a token"
     assert by_action["get_all_channels"]["Authorization"] == "Bearer TESTTOKEN123"
     assert "MAG200 stbapp" in by_action["get_all_channels"]["User-Agent"]
     assert "mac=00%3A1A%3A79%3AAA%3ABB%3ACC" in by_action["get_all_channels"]["Cookie"]
     print("headers (UA / Bearer / MAC cookie): OK")
+
+    # The portal asked for credentials and got them, in the right order.
+    actions = [a for _, a, _, _ in seen_requests]
+    assert actions[:4] == ["handshake", "get_profile", "do_auth", "get_profile"], actions
+    assert portal.auth_method == "credentials", portal.auth_method
+
+    profiles = [p for _, a, _, p in seen_requests if a == "get_profile"]
+    # not_valid=1 from the handshake must come back as not_valid_token=1.
+    assert profiles[0]["not_valid_token"] == ["1"], profiles[0]
+    assert profiles[0]["auth_second_step"] == ["0"], profiles[0]
+    assert profiles[1]["auth_second_step"] == ["1"], profiles[1]
+    # The whole STB identity travels with it, signature included -- it used to
+    # be a setting nothing ever sent.
+    assert profiles[0]["signature"] == [s.DEFAULT_SIGNATURE], profiles[0]
+    assert profiles[0]["stb_type"] == [s.DEFAULT_MODEL], profiles[0]
+    assert profiles[0]["sn"] == [s.DEFAULT_SERIAL], profiles[0]
+    assert profiles[0]["hw_version"] == [s.STB_HW_VERSION], profiles[0]
+    assert "PORTAL version: 4.9.9" in profiles[0]["ver"][0], profiles[0]
+    print("get_profile state machine (status 2 -> do_auth -> second step): OK")
 
     # ffmpeg argv construction, as resolver.py builds it.
     import resolver

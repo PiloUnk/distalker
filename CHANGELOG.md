@@ -1,5 +1,35 @@
 # Changelog
 
+## Unreleased
+
+**Connecting**
+
+- **The portal now decides which authentication it gets.** Distalker reads the
+  `status` its profile request comes back with and does what it asks: nothing
+  further when the session is already good, or `do_auth` followed by a second
+  profile call when the portal says it wants credentials. It used to pick the
+  flow itself from whether a username and password happened to be configured,
+  which was wrong in both directions — it ran a device-ID step at portals that
+  wanted a password, and had no way to tell a refused account from an empty
+  channel list.
+- A portal that refuses the account now says so in the provider's own words —
+  "subscription expired", "blocked" — instead of failing later as a channel
+  list that came back empty and a suggestion to check the MAC address.
+- A portal that wants credentials and has none on its line now fails the sync
+  with that as the message, rather than appearing to work.
+- Expired sessions are recognised from the plain-text `Authorization failed.`
+  some portals answer with, and from HTTP 401/403, instead of being reported as
+  a portal talking nonsense.
+- The box's profile now carries the full identity every other Stalker client
+  sends, `signature` included — which had been a documented setting that no
+  request ever contained, so setting it configured nothing.
+- Portals with no profile endpoint at all keep working on the MAC alone, with a
+  warning. That tolerance is deliberate: most portals this plugin meets are not
+  Ministra and answer with less than it would.
+- The `device_id_auth` line key is gone. Nothing needs to be changed: it was
+  never something to write on a portal line, only a value the plugin derived
+  for itself, and lines are re-read on every sync.
+
 ## 0.9.2
 
 **Playing**

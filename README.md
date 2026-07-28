@@ -193,9 +193,9 @@ http://portal.example.com/c/ | 00:1A:79:AA:BB:CC | model=MAG322 timezone=Europe/
 | --- | --- | --- |
 | `model` | `MAG254` | Sent as the `X-User-Agent` device model. Also `MAG250`, `MAG322`, … |
 | `serial` | `0000000000000` | Portal cookie `sn`. |
-| `device_id` | 64 × `f` | Sent during device-ID authentication. |
+| `device_id` | 64 × `f` | Sent with the box's profile, and with credentials. |
 | `device_id2` | same as `device_id` | Most boxes carry the same value in both slots. |
-| `signature` | 64 × `f` | Accepted, but **currently unused**: no request Distalker makes includes it. |
+| `signature` | 64 × `f` | Sent with the box's profile. |
 | `timezone` | `UTC` | Portal cookie `timezone`, e.g. `Europe/Paris`. |
 
 > **These are the untested part of this plugin.** Every portal it has run
@@ -204,11 +204,20 @@ http://portal.example.com/c/ | 00:1A:79:AA:BB:CC | model=MAG322 timezone=Europe/
 > gets it wrong, that is a bug worth reporting with the values your provider
 > gave you.
 
-Which authentication runs is decided by one thing — whether you supplied
-credentials. With a username *and* password: handshake, then `do_auth`. Without:
-handshake, then a device-ID step. A failed device-ID step is **not fatal**, as
-plenty of portals authorise on the MAC alone; if the session really is
-unauthorised, the channel fetch says so straight after, and far more clearly.
+**The portal decides which authentication runs**, not the settings. Distalker
+shakes hands, presents the box's profile, and does what the answer asks for:
+nothing more if the portal is satisfied, or `do_auth` with your username and
+password if it says it wants them. If it refuses the account outright, the
+message you get is the provider's own — "subscription expired", "blocked" —
+rather than a guess made here.
+
+So credentials on a portal line are there for the portals that ask; a portal
+that never asks ignores them. Two consequences worth knowing:
+
+- A portal that asks for credentials **and has none on its line** now fails the
+  sync, saying so. It used to fetch an empty channel list and blame the MAC.
+- A portal that has no profile endpoint at all — some do not — still works, with
+  a warning in the log, on the strength of the MAC alone.
 
 ### Other settings
 

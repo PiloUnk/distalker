@@ -492,11 +492,10 @@ def test_portal(cfg: PortalConfig) -> Dict[str, Any]:
     return {
         "portal": cfg.name,
         "url": cfg.url,
-        "auth": (
-            "credentials"
-            if (cfg.username and cfg.password)
-            else ("device-id" if cfg.device_id_auth else "handshake only")
-        ),
+        # What the portal actually asked for, not what was configured: a line
+        # carrying credentials against a portal that never requests them is
+        # reported as the handshake-only portal it is.
+        "auth": portal.auth_method,
         "groups": len(genres),
         "warnings": portal.warnings,
     }

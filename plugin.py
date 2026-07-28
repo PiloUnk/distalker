@@ -484,7 +484,7 @@ class Plugin:
     # must not cost a download of everything the user already has.
     LINEUP_KEYS = (
         "url", "mac", "username", "password", "device_id", "device_id2",
-        "serial_number", "model", "timezone", "device_id_auth",
+        "serial_number", "model", "timezone", "signature",
     )
 
     def _plan(self, portals: List[PortalConfig]) -> Dict[str, Any]:

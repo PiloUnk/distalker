@@ -15,10 +15,6 @@ def test_builtin_defaults():
     assert portal.timezone == s.DEFAULT_TIMEZONE
     assert portal.device_id == s.DEFAULT_DEVICE_ID
     assert portal.signature == s.DEFAULT_SIGNATURE
-    # No credentials selects device-ID auth even with the default ffff... IDs,
-    # matching stalkerhek's `deviceIdAuth := Username == "" && Password == ""`.
-    # This is the plain URL+MAC case, so it must not regress.
-    assert portal.device_id_auth is True
 
 
 def test_stb_identity_is_per_portal():
@@ -44,13 +40,12 @@ def test_stb_identity_is_per_portal():
     assert plain.device_id == s.DEFAULT_DEVICE_ID
 
 
-def test_credentials_beat_device_id_auth():
+def test_credentials_are_read_off_the_line():
     (portal,), _ = s.parse_portals(
         "U | http://c.example/c/ | 00:1A:79:AA:BB:02 | username=joe password=pw device_id="
         + "A" * 64
     )
     assert portal.username == "joe" and portal.password == "pw"
-    assert portal.device_id_auth is False
 
 
 def test_extras_split_by_space_and_pipe_and_quotes():
@@ -116,15 +111,18 @@ def test_url_only_and_mac_only_config():
     assert not errors
     assert portal.url == "http://somedomain.com:8080/c/portal.php"
     assert portal.mac == "00:1A:79:AA:BB:CC"
-    assert portal.device_id_auth is True
     assert portal.username == "" and portal.password == ""
     assert portal.max_streams == 1
 
 
-def test_partial_credentials_fall_back_to_device_auth():
-    """A username with no password is not usable credentials."""
+def test_partial_credentials_are_kept_as_written():
+    """A username with no password is not usable credentials.
+
+    Kept rather than rejected: login() only reaches for them when the portal
+    asks (profile status 2), and it is the one that decides they are missing.
+    """
     (portal,), _ = s.parse_portals("A | http://a.example/c/ | 00:1A:79:AA:BB:01 | username=joe")
-    assert portal.device_id_auth is True
+    assert portal.username == "joe" and portal.password == ""
 
 
 def test_pseudo_url_roundtrip():
