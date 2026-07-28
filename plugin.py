@@ -1,3 +1,6 @@
+# Copyright (C) 2026 PiloUnk
+# SPDX-License-Identifier: AGPL-3.0-only
+# See LICENSE for the full terms and NOTICE for prior-art attribution.
 """Distalker -- Stalker/MAG portal support for Dispatcharr.
 
 Replaces the "one proxy container, one published port per portal" pattern with

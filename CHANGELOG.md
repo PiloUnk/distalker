@@ -1,5 +1,20 @@
 # Changelog
 
+## Unreleased
+
+**Licence**
+
+- Distalker is now **AGPL-3.0-only**, the licence Dispatcharr itself uses. The
+  plugin runs inside Dispatcharr's process and imports its models, so the two
+  form one program in practice; they now place the same obligation on whoever
+  redistributes them. Running it, modifying it and selling it are all still
+  permitted — publishing a modified version, or offering one over a network,
+  now owes users the source.
+- Prior-art attribution moves to a new `NOTICE` file, and is corrected there:
+  stalkerhek is GPL-3.0, not MIT as the 0.9.1 `LICENSE` stated.
+- Releases up to and including 0.9.1 remain under MIT. That grant cannot be
+  withdrawn and is not being withdrawn.
+
 ## 0.9.1
 
 First release. Stalker/MAG portal support for Dispatcharr, with no sidecar

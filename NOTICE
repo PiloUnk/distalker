@@ -1,0 +1,37 @@
+Distalker -- Stalker/MAG portal support for Dispatcharr.
+Copyright (C) 2026 PiloUnk
+
+This program is free software: you can redistribute it and/or modify it under
+the terms of the GNU Affero General Public License, version 3 only, as
+published by the Free Software Foundation. The full terms are in LICENSE.
+
+Distalker is a plugin for Dispatcharr (https://github.com/Dispatcharr/Dispatcharr),
+which is itself distributed under the GNU Affero General Public License v3.
+The licences are the same one so that the plugin and the program it loads into
+place the same obligations on whoever redistributes them.
+
+Releases up to and including 0.9.1 were published under the MIT Licence. That
+grant is irrevocable for those versions; the AGPL applies from the next release
+onwards.
+
+
+Prior art
+---------
+
+Distalker's Stalker portal protocol implementation (stalker_api.py) is a Python
+reimplementation informed by stalkerhek, a Stalker portal proxy written in Go:
+
+  * https://github.com/erkexzcx/stalkerhek -- the original, now archived,
+    distributed under the GNU General Public License v3.
+  * https://github.com/kidpoleon/stalkerhek -- a later continuation,
+    Copyright (C) 2025 kidpoleon <kidpoleon@proton.me>, distributed under the
+    GNU General Public License v3 or later.
+
+The LICENSE file shipped with Distalker 0.9.1 described both as MIT. That was
+an error of fact, corrected here: both are GPL-3.0.
+
+Section 13 of the GNU GPL v3 grants permission to combine a GPL-covered work
+with a work licensed under the GNU Affero GPL v3, which is what the choice of
+AGPL-3.0-only makes possible here. Whatever in stalker_api.py is owed to
+stalkerhek therefore travels under terms compatible with the licence of the
+work as a whole, and this attribution is preserved in every copy.

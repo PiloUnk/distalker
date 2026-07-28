@@ -377,8 +377,14 @@ How the plugin is built, and the Dispatcharr behaviours that shape it, are in
 Built for [Dispatcharr](https://github.com/Dispatcharr/Dispatcharr).
 
 Prior-art attribution for the Stalker protocol implementation is recorded in
-[LICENSE](LICENSE).
+[NOTICE](NOTICE).
 
 ## Licence
 
-MIT — see [LICENSE](LICENSE).
+AGPL-3.0-only — see [LICENSE](LICENSE), and [NOTICE](NOTICE) for the copyright
+and prior-art attribution.
+
+The same licence Dispatcharr itself uses. You may run, modify and redistribute
+Distalker freely, including commercially; if you distribute a modified version,
+or offer one to users over a network, you owe them its source under these same
+terms. Releases up to 0.9.1 were published under MIT and stay MIT.

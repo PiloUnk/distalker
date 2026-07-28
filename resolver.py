@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright (C) 2026 PiloUnk
+# SPDX-License-Identifier: AGPL-3.0-only
+# See LICENSE for the full terms and NOTICE for prior-art attribution.
 """Resolve a Distalker pseudo-URL to a live portal link, then become ffmpeg.
 
 Dispatcharr spawns this at tune time via the "Distalker" stream profile:

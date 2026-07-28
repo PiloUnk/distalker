@@ -330,6 +330,10 @@ read at all.
   line-by-line narration, and record the constraint that forced a decision.
 - Commit messages follow the same rule: what was wrong, why the fix takes this
   shape, what it costs. They are long by design.
+- Every source file carries the three-line `SPDX-License-Identifier` header.
+  Anything contributed here is contributed under **AGPL-3.0-only**, the same
+  licence as the rest: with no CLA, nothing can be relicensed later without
+  every contributor agreeing, so the licence has to be right on the way in.
 - `logo.svg` is the source for `logo.png`, and `banner.svg` for the README's
   `banner.png`; both document their regeneration command in a header comment,
   and both need `cairosvg` (ImageMagick's built-in SVG renderer mangles arcs and

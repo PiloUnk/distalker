@@ -1,3 +1,6 @@
+# Copyright (C) 2026 PiloUnk
+# SPDX-License-Identifier: AGPL-3.0-only
+# See LICENSE for the full terms and NOTICE for prior-art attribution.
 """Durable storage for the portal list, outside the plugin's settings.
 
 Dispatcharr's plugin panel writes its own React state over ``PluginConfig.settings``

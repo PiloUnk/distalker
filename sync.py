@@ -1,3 +1,6 @@
+# Copyright (C) 2026 PiloUnk
+# SPDX-License-Identifier: AGPL-3.0-only
+# See LICENSE for the full terms and NOTICE for prior-art attribution.
 """Django-side work: generate M3U files and wire up Dispatcharr's models.
 
 Everything in here runs inside Dispatcharr (plugin action or Celery task) and

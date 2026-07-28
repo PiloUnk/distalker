@@ -1,3 +1,6 @@
+# Copyright (C) 2026 PiloUnk
+# SPDX-License-Identifier: AGPL-3.0-only
+# See LICENSE for the full terms and NOTICE for prior-art attribution.
 """Stalker portal client and shared Redis state.
 
 This module is deliberately free of Django imports. It is shared by two very
@@ -11,7 +14,7 @@ Only ``requests``, ``redis`` and the standard library may be imported here.
 Both are already dependencies of Dispatcharr, so no extra install is needed.
 
 The protocol implementation is a Python reimplementation informed by stalkerhek
-(MIT), originally by erkexzcx and continued in later forks. See LICENSE.
+(GPL-3.0), originally by erkexzcx and continued in later forks. See NOTICE.
 """
 
 from __future__ import annotations
