@@ -25,6 +25,9 @@ jobs:
       - name: Config and protocol tests
         run: python3 tests/test_config.py
 
+      - name: Authentication state machine test
+        run: python3 tests/test_auth.py
+
       - name: Mock portal integration test
         run: python3 tests/test_mock_portal.py
 
