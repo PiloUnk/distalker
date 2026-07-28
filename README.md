@@ -273,8 +273,9 @@ button you should need.
 ### Sync only fetches what changed
 
 A line-up is one request per portal that a busy provider can take minutes to
-assemble, so re-downloading portals that did not change is time spent for
-nothing:
+assemble — and on portals that refuse to list everything at once, hundreds of
+requests instead, collected page by page. Either way, re-downloading portals
+that did not change is time spent for nothing:
 
 | Your line | What Sync does |
 | --- | --- |
@@ -347,7 +348,8 @@ Resolver output otherwise appears in the channel's log, prefixed `[distalker]`:
 | `cannot reach Redis (…); reading the mirrored portal instead` | Informational — playback carried on from the copy on disk. |
 | `cached session rejected` | Normal. The token expired and is being renewed. |
 | `create_link returned an empty command` | The portal refused the channel — often a connection limit or an expired subscription. |
-| `portal returned an empty channel list` | Wrong MAC address or portal URL. |
+| `portal returned an empty channel list` | Wrong MAC address or portal URL. Reported only after paging the line-up was tried too and also came back empty. |
+| `the portal would not list its channels in one request … collecting them a page at a time` | Informational. This portal caps or lacks `get_all_channels`, so the sync is reading its line-up page by page. Expect it to take minutes on a large bouquet. |
 | ffmpeg: `Server returned 5XX Server Error reply` | The portal issued a link but refused to serve it. Probe it (below) — usually a connection limit. |
 
 **Nothing plays and you see 503 / "max connections".** Every viewer, preview,

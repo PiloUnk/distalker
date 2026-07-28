@@ -35,6 +35,15 @@
 
 **Syncing**
 
+- **Portals that will not list their channels in one request now sync.** Some
+  cap `get_all_channels`, some never implemented it; either way the portal was
+  unusable, since the empty answer was reported as a probable wrong MAC. The
+  line-up is now collected a page at a time instead when that happens — slower
+  by a long way on a big bouquet, and the only way those portals work at all.
+  The sync log says when it has fallen back and how far along it is.
+- A portal that refuses the session is not paged as a second attempt, and an
+  empty listing from both routes still reports the original "check the MAC
+  address" message, which remains the likelier explanation.
 - Channel logos survive two shapes that used to come out broken: a logo served
   from another scheme than `http(s)` was treated as a filename and glued behind
   the portal's logo path, and an inline `data:` image got the same treatment.

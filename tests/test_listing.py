@@ -126,6 +126,174 @@ def test_the_playlist_does_not_advertise_catch_up():
     assert "catchup" not in m3u.lower(), m3u
 
 
+# -- paging --------------------------------------------------------------
+
+
+def scripted(all_channels, pages):
+    """A portal whose two listing calls answer from canned data.
+
+    ``all_channels`` is the get_all_channels payload, or an exception to raise.
+    ``pages`` maps a page number to its 'js' object; a page not in it answers
+    empty, which is what a portal past its last page does.
+    """
+    p = portal()
+    p.pages_asked = []
+
+    def fake_get_json(query, with_auth=True):
+        if "get_all_channels" in query:
+            if isinstance(all_channels, Exception):
+                raise all_channels
+            return all_channels
+        page = int(query.split("&p=")[1].split("&")[0])
+        p.pages_asked.append(page)
+        return {"js": pages.get(page, {"data": []})}
+
+    p._get_json = fake_get_json
+    return p
+
+
+def page(ids, **extra):
+    js = {"data": [row(id=str(i), name=f"Ch {i}", cmd=f"ffmpeg http://x/{i}")
+                   for i in ids]}
+    js.update(extra)
+    return js
+
+
+REFUSED = s.PortalError("portal returned an empty channel list (check the MAC address)")
+
+
+def test_a_portal_that_answers_in_one_request_is_never_paged():
+    p = scripted({"js": {"data": [row()]}}, {})
+    assert len(p.list_channels()) == 1
+    assert p.pages_asked == [], "paging must stay the expensive last resort"
+
+
+def test_paging_takes_over_when_the_single_request_will_not():
+    p = scripted(REFUSED, {1: page([1, 2]), 2: page([3])})
+    channels = p.list_channels()
+    assert [c.channel_id for c in channels] == ["1", "2", "3"]
+    assert p.pages_asked == [1, 2, 3], p.pages_asked
+
+
+def test_the_reported_page_count_bounds_the_walk():
+    """The guard open-tv lacks: the portal said how much there was.
+
+    Its last page is full, so 'stop on an empty page' would ask for one more;
+    these pages never repeat, so 'stop on a repeat' would never fire either.
+    """
+    pages = {1: page([1, 2], total_items=4, max_page_items=2), 2: page([3, 4])}
+    p = scripted(REFUSED, pages)
+    assert len(p.list_channels()) == 4
+    assert p.pages_asked == [1, 2], p.pages_asked
+
+
+def test_a_page_count_sent_as_strings_still_counts():
+    pages = {1: page([1, 2], total_items="3", max_page_items="2"), 2: page([3])}
+    p = scripted(REFUSED, pages)
+    assert len(p.list_channels()) == 3
+    assert p.pages_asked == [1, 2], p.pages_asked
+
+
+def test_an_odd_remainder_gets_its_last_page():
+    pages = {1: page([1, 2], total_items=5, max_page_items=2),
+             2: page([3, 4]), 3: page([5])}
+    p = scripted(REFUSED, pages)
+    assert len(p.list_channels()) == 5
+    assert p.pages_asked == [1, 2, 3], p.pages_asked
+
+
+def test_a_portal_replaying_its_last_page_does_not_loop_forever():
+    """Clamping 'p' instead of running out is common, and open-tv hangs on it."""
+    p = portal()
+    p.pages_asked = []
+
+    def fake_get_json(query, with_auth=True):
+        if "get_all_channels" in query:
+            raise REFUSED
+        p.pages_asked.append(int(query.split("&p=")[1].split("&")[0]))
+        return {"js": page([1, 2])}  # the same two channels, always
+
+    p._get_json = fake_get_json
+    channels = p.list_channels()
+    assert [c.channel_id for c in channels] == ["1", "2"]
+    assert p.pages_asked == [1, 2], p.pages_asked
+
+
+def test_an_empty_page_ends_it():
+    p = scripted(REFUSED, {1: page([1, 2])})
+    assert len(p.list_channels()) == 2
+    assert p.pages_asked == [1, 2], p.pages_asked
+
+
+def test_the_hard_cap_catches_a_portal_inventing_channels():
+    """No total, never empty, never repeating: only the cap is left."""
+    p = portal()
+    counter = [0]
+
+    def fake_get_json(query, with_auth=True):
+        if "get_all_channels" in query:
+            raise REFUSED
+        counter[0] += 1
+        return {"js": page([counter[0]])}
+
+    p._get_json = fake_get_json
+    original = s.ORDERED_LIST_PAGE_CAP
+    s.ORDERED_LIST_PAGE_CAP = 5
+    try:
+        assert len(p.list_channels()) == 5
+    finally:
+        s.ORDERED_LIST_PAGE_CAP = original
+
+
+def test_duplicates_across_pages_are_collapsed():
+    p = scripted(REFUSED, {1: page([1, 2]), 2: page([2, 3])})
+    assert [c.channel_id for c in p.list_channels()] == ["1", "2", "3"]
+
+
+def test_when_neither_works_the_useful_message_survives():
+    """Paging must not replace 'check the MAC' with something vaguer.
+
+    An empty listing is far more often a wrong MAC than a portal that needs
+    paging, so the first failure stays the one the user is shown.
+    """
+    p = scripted(REFUSED, {})
+    try:
+        p.list_channels()
+    except s.PortalError as exc:
+        assert "MAC address" in str(exc), exc
+
+
+def test_a_refused_session_is_not_paged_at_all():
+    p = scripted(s.PortalAuthError("blocked"), {1: page([1])})
+    try:
+        p.list_channels()
+    except s.PortalAuthError:
+        pass
+    else:
+        raise AssertionError("a refusal must not be retried by another route")
+    assert p.pages_asked == [], "asking again is how a MAC gets noticed"
+
+
+def test_the_sync_is_told_what_is_happening():
+    notes = []
+    p = scripted(REFUSED, {1: page([1, 2], total_items=4, max_page_items=2),
+                           2: page([3, 4])})
+    p.list_channels(progress=notes.append)
+    joined = " | ".join(notes)
+    assert "page at a time" in joined, notes
+    assert "2 pages" in joined, notes
+    assert "4 channels" in joined, notes
+
+
+def test_the_page_request_asks_for_everything():
+    p = portal()
+    asked = []
+    p._get_json = lambda q, with_auth=True: asked.append(q) or {"js": {"data": []}}
+    p.get_ordered_list(3)
+    assert "genre=*" in asked[0] and "sortby=number" in asked[0], asked
+    assert "fav=0" in asked[0] and "&p=3" in asked[0], asked
+
+
 if __name__ == "__main__":
     failures = 0
     for name, fn in sorted(globals().items()):

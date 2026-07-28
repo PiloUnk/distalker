@@ -82,6 +82,14 @@ AUTH_FAILED_BODY = "authorization failed."
 # enough bill for covering the transient half.
 RETRYABLE_STATUS = frozenset({429, 500, 502, 503, 504})
 
+# Last-resort bound on the paginated channel listing, for a portal that keeps
+# answering with something new and never says how much there is. Deliberately
+# far above any real line-up: whenever the portal reports 'total_items' the
+# computed page count wins long before this, and the two cheaper guards --
+# an empty page, a page that repeats one already read -- stop nearly everything
+# else. This only catches a portal generating rubbish indefinitely.
+ORDERED_LIST_PAGE_CAP = 1000
+
 # Seconds before the 1st, 2nd and 3rd retry. Fixed rather than jittered: the
 # calls that retry are made one portal at a time from a single process, so
 # there is no herd to spread out, and a deterministic delay is one a test can
@@ -264,6 +272,18 @@ def extract_link(raw: str) -> str:
         if _LINK_RE.match(candidate):
             return candidate
     return ""
+
+
+def as_int(value: Any, default: int = 0) -> int:
+    """An int from whatever the portal felt like sending.
+
+    Numbers arrive as numbers on some portals and as strings on others, often
+    both within one response, so nothing that reads a count can assume either.
+    """
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError):
+        return default
 
 
 def slugify(value: str) -> str:
@@ -1375,6 +1395,130 @@ class Portal:
             tv_archive=str(row.get("enable_tv_archive") or "0") not in ("0", ""),
             tv_archive_duration=str(row.get("tv_archive_duration") or ""),
         )
+
+    def get_ordered_list(self, page: int) -> Dict[str, Any]:
+        """One page of the paginated listing, as the MAG interface browses it.
+
+        ``genre=*`` is every genre, which is what the box asks for on its "All"
+        screen. pvr.stalker leaves it out -- its request builder drops any
+        optional parameter still equal to its own default, and its default is
+        ``*`` -- but sending it says the same thing to portals that have no
+        such default to fall back on.
+        """
+        data = self._get_json(
+            "type=itv&action=get_ordered_list&JsHttpRequest=1-xml"
+            f"&genre=*&fav=0&sortby=number&p={int(page)}"
+        )
+        js = data.get("js") if isinstance(data, dict) else None
+        return js if isinstance(js, dict) else {}
+
+    def list_channels(self, progress=None) -> List[ChannelEntry]:
+        """Every channel, however this portal is willing to hand them over.
+
+        ``get_all_channels`` first, because one request for the whole line-up is
+        what nearly every portal supports and is enormously cheaper. Portals
+        that cap it, or never implemented it, answer with an error or with
+        nothing -- and used to leave the portal unusable. For those, the listing
+        is collected a page at a time instead: hundreds of requests where there
+        was one, several minutes where there were seconds, and worth every bit
+        of it because the alternative is a portal that cannot be synced at all.
+
+        ``progress`` is called with a line of English whenever there is
+        something worth saying, so a sync that has gone quiet for four minutes
+        can account for itself. Passed as a callback rather than a logger to
+        keep this module free of anything Django-shaped.
+
+        A portal that refuses the session is not asked twice: paging would be
+        refused for exactly the same reason, and the second refusal is the one
+        that would get a MAC noticed.
+        """
+        try:
+            return self.get_all_channels()
+        except PortalAuthError:
+            raise
+        except PortalError as exc:
+            single_shot_failure = exc
+
+        if progress:
+            progress(
+                f"the portal would not list its channels in one request "
+                f"({single_shot_failure}); collecting them a page at a time"
+            )
+
+        channels = self._paged_channels(progress)
+        if not channels:
+            # Nothing worked, so the first failure is the one worth reporting:
+            # it is the one whose message names the likely cause.
+            raise single_shot_failure
+
+        if progress:
+            progress(f"collected {len(channels)} channels by paging")
+        return channels
+
+    def _paged_channels(self, progress=None) -> List[ChannelEntry]:
+        """Walk get_ordered_list until one of three things says to stop.
+
+        All three are needed, because each covers a portal the others do not:
+
+        * the page count the portal itself implies, from ``total_items`` and
+          ``max_page_items`` on the first page. The bound pvr.stalker uses, and
+          the only one that stops at exactly the right place.
+        * a page with no rows. What a well-behaved portal does past the end,
+          and open-tv's only guard.
+        * a page whose rows have all been seen already. Portals that clamp ``p``
+          to their last page answer forever otherwise, which is the case that
+          turns open-tv's loop into an infinite one.
+        """
+        channels: List[ChannelEntry] = []
+        seen = set()
+        max_pages = ORDERED_LIST_PAGE_CAP
+        page = 1
+
+        while page <= max_pages:
+            js = self.get_ordered_list(page)
+            rows = js.get("data")
+            if not isinstance(rows, list) or not rows:
+                break
+
+            if page == 1:
+                implied = self._page_count(js)
+                if implied:
+                    max_pages = min(max_pages, implied)
+                    if progress:
+                        progress(f"the portal reports {implied} pages to read")
+
+            fresh = 0
+            for row in rows:
+                channel = self._channel_from_row(row)
+                if channel is None:
+                    continue
+                # The id when there is one, the command when there is not: two
+                # channels never share a command, and a portal that omits ids
+                # would otherwise collapse its whole line-up into one entry.
+                key = channel.channel_id or channel.cmd
+                if key in seen:
+                    continue
+                seen.add(key)
+                channels.append(channel)
+                fresh += 1
+
+            if not fresh:
+                break
+
+            if progress and page % 20 == 0:
+                progress(f"page {page}, {len(channels)} channels so far")
+            page += 1
+
+        return channels
+
+    @staticmethod
+    def _page_count(js: Dict[str, Any]) -> int:
+        """How many pages the portal implies, or 0 when it does not say."""
+        total = as_int(js.get("total_items"))
+        per_page = as_int(js.get("max_page_items"))
+        if total > 0 and per_page > 0:
+            return (total + per_page - 1) // per_page
+        return 0
 
     def create_link(self, cmd: str) -> str:
         """Ask the portal for a playable URL for ``cmd``.

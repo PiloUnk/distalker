@@ -437,7 +437,9 @@ def sync_portal(cfg: PortalConfig, logger, trigger_refresh: bool = True) -> Dict
     if snapshot["blocked"]:
         logger.warning("distalker: portal '%s' reports the account as blocked", cfg.name)
 
-    channels = portal.get_all_channels()
+    channels = portal.list_channels(
+        progress=lambda note: logger.info("distalker: %s: %s", cfg.name, note)
+    )
     genres = portal.get_genres()
 
     # The resolver reads this at tune time; publish it before the M3U lands so
