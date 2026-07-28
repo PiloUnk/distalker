@@ -198,6 +198,15 @@ class PortalError(Exception):
     """Raised when the portal rejects us or answers with nonsense."""
 
 
+class PortalEndpointError(PortalError):
+    """Something answered, but it was not a Stalker API.
+
+    A 404, or a body that is not JSON at all. Separated because it is the one
+    failure with a second thing worth trying: the same portal on its other
+    path -- see :func:`alternate_endpoint`.
+    """
+
+
 class PortalAuthError(PortalError):
     """The portal understood us and refused the session.
 
@@ -598,6 +607,41 @@ def normalize_portal_url(url: str) -> str:
     return parsed._replace(path=path).geturl()
 
 
+def alternate_endpoint(url: str) -> str:
+    """The other place a Stalker API lives, or '' when there isn't one.
+
+    Ministra answers on two paths and installs differ in which they expose:
+    ``<base>/c/portal.php``, which is what :func:`normalize_portal_url` builds
+    and what most providers hand out, and ``<base>/server/load.php``, which is
+    the older canonical one and the only one pvr.stalker has ever asked for.
+    A portal serving just one of them used to be unusable if the user had been
+    given the other, with a 404 and nothing to suggest.
+
+    The mapping is pvr.stalker's, read backwards as well as forwards::
+
+        http://h/c/portal.php                -> http://h/server/load.php
+        http://h/stalker_portal/c/portal.php -> http://h/stalker_portal/server/load.php
+        http://h/server/load.php             -> http://h/c/portal.php
+    """
+    parsed = urlparse(url)
+    path = parsed.path
+    directory, _, filename = path.rpartition("/")
+    filename = filename.lower()
+
+    if filename == "portal.php":
+        base = directory[:-2] if directory.lower().endswith("/c") else directory
+        new_path = base + "/server/load.php"
+    elif filename == "load.php":
+        base = directory[:-7] if directory.lower().endswith("/server") else directory
+        new_path = base + "/c/portal.php"
+    else:
+        return ""
+
+    if new_path == path:
+        return ""
+    return parsed._replace(path=new_path).geturl()
+
+
 # ---------------------------------------------------------------------------
 # Shared state: Redis, mirrored to disk
 # ---------------------------------------------------------------------------
@@ -994,6 +1038,11 @@ class Portal:
         retries: int = 0,
     ):
         self.cfg = cfg
+        # Where the API is asked, which starts as the configured URL and may be
+        # swapped once by login() for the portal's other endpoint. Kept apart
+        # from cfg.url on purpose: that one is still what logos are resolved
+        # against, and swapping the API path must not move them.
+        self.url = cfg.url
         self.token = token
         # The portal's own setting unless a caller insists, so every request
         # made about a portal honours what the user configured for it.
@@ -1091,7 +1140,7 @@ class Portal:
         raise PortalError(last_error or "request to portal failed")
 
     def _get_json(self, query: str, with_auth: bool = True) -> Any:
-        url = f"{self.cfg.url}?{query}&{self._common_params(with_auth)}"
+        url = f"{self.url}?{query}&{self._common_params(with_auth)}"
         resp = self._request("GET", url, headers=self._headers(with_auth))
 
         if resp.status_code in (401, 403):
@@ -1101,10 +1150,15 @@ class Portal:
 
         if resp.status_code < 200 or resp.status_code >= 300:
             snippet = (resp.text or "").strip()[:300]
-            raise PortalError(
-                f"portal returned HTTP {resp.status_code}"
-                + (f": {snippet}" if snippet else "")
+            message = f"portal returned HTTP {resp.status_code}" + (
+                f": {snippet}" if snippet else ""
             )
+            # A 404 is a web server saying nothing lives at this path -- which
+            # is a statement about the path, not about the portal, and login()
+            # has somewhere else to look.
+            if resp.status_code == 404:
+                raise PortalEndpointError(message)
+            raise PortalError(message)
 
         try:
             return resp.json()
@@ -1115,7 +1169,10 @@ class Portal:
             # lets the resolver re-authenticate instead of failing the tune.
             if snippet.lower() == AUTH_FAILED_BODY:
                 raise PortalAuthError("portal says the session is no longer authorised")
-            raise PortalError(f"portal returned non-JSON response: {snippet}")
+            # Anything else that is not JSON is an HTML error page, a login
+            # form, or a landing page: something is listening, but it is not a
+            # Stalker API, so the other endpoint is worth a try.
+            raise PortalEndpointError(f"portal returned non-JSON response: {snippet}")
 
     # -- authentication ---------------------------------------------------
 
@@ -1155,7 +1212,7 @@ class Portal:
         }
         headers = self._headers()
         headers["Content-Type"] = "application/x-www-form-urlencoded"
-        url = f"{self.cfg.url}?{self._common_params()}"
+        url = f"{self.url}?{self._common_params()}"
         resp = self._request("POST", url, data=form, headers=headers)
 
         try:
@@ -1228,7 +1285,7 @@ class Portal:
           explicit refusal (:class:`PortalAuthError`) is still fatal, because
           that is the portal answering rather than failing to.
         """
-        self.handshake()
+        self._handshake_on_either_endpoint()
 
         try:
             self.profile = self.get_profile()
@@ -1263,6 +1320,47 @@ class Portal:
             )
 
         return self.token
+
+    def _handshake_on_either_endpoint(self) -> None:
+        """Shake hands, trying the portal's other API path if this one is not it.
+
+        The handshake is every session's first request, so a portal reached at
+        the wrong path fails here and nowhere later -- which makes this the one
+        place worth spending an extra round-trip on.
+
+        Only a :class:`PortalEndpointError` earns that second try: a 404, or an
+        answer that is not JSON. A portal that is unreachable, unwell or
+        refusing the MAC would answer identically on both paths, and at tune
+        time a wasted round-trip is time Dispatcharr is not yet spending on the
+        next source.
+
+        The swap lasts for this session only. Nothing is written back, so the
+        cost is one failed request per sync and per token expiry -- small, and
+        the warning tells the user how to stop paying it for good.
+        """
+        try:
+            self.handshake()
+            return
+        except PortalEndpointError as exc:
+            alternate = alternate_endpoint(self.url)
+            if not alternate:
+                raise
+            first_failure = exc
+
+        self.url = alternate
+        try:
+            self.handshake()
+        except PortalError:
+            # The other path is no better. Report the original failure: it is
+            # the one about the URL the user actually configured.
+            self.url = self.cfg.url
+            raise first_failure
+
+        self.warnings.append(
+            f"the portal does not answer at {self.cfg.url} ({first_failure}), "
+            f"but does at {alternate}; put that on its portal line to save a "
+            "failed request on every sync"
+        )
 
     @staticmethod
     def _profile_status(profile: Dict[str, Any]) -> int:
@@ -1328,12 +1426,14 @@ class Portal:
 
         return snapshot
 
-    def watchdog(self) -> None:
-        """Keep-alive ping. Only needed by portals that drop idle sessions."""
-        self._get_json(
-            "action=get_events&event_active_id=0&init=0&type=watchdog"
-            "&cur_play_type=1&JsHttpRequest=1-xml"
-        )
+    # There is no watchdog here, and its absence is a decision rather than an
+    # omission. Stalker clients keep a session warm by calling get_events every
+    # 'timeslot' seconds, which needs something alive between requests to do the
+    # calling. This plugin has no such thing: the sync is a task that ends, and
+    # the resolver is a process that becomes ffmpeg. A ping method existed for
+    # two releases with no caller, which is worse than not having one -- it read
+    # as a feature. Sessions are re-established instead, which is what the token
+    # cache and the resolver's re-authentication are for.
 
     # -- content ----------------------------------------------------------
 

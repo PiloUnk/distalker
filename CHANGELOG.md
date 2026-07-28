@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+**After upgrading, press Test portals, then Re-fetch all.** Sync alone will
+report every portal as unchanged and fetch nothing: it compares your settings
+against what was last published, and none of them changed — only the code did.
+Test first, since it writes nothing and is where a portal that now needs
+credentials will say so.
+
 **Connecting**
 
 - **The portal now decides which authentication it gets.** Distalker reads the
@@ -32,6 +38,13 @@
 - The MAC and the session token now travel in the query string as well as in
   the cookie and the `Authorization` header. Portals read one form or the
   other, and sending both costs nothing.
+- **A portal reached at the wrong path now finds itself.** Ministra answers on
+  both `…/c/portal.php` and `…/server/load.php`, and installs differ in which
+  they expose; being handed the one your provider does not serve used to mean a
+  404 and no suggestion. The other path is now tried once, and the log says
+  which one worked so you can put it on the portal line and stop paying for the
+  failed request. Only a 404 or a reply that is not JSON earns the second
+  attempt — a portal that is merely down answers the same way on both.
 
 **Syncing**
 

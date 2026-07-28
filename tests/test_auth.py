@@ -245,6 +245,67 @@ def test_a_reply_that_is_simply_not_a_link_is_not_an_auth_error():
         pass
 
 
+def test_the_other_endpoint_is_tried_when_this_one_is_not_an_api():
+    """Ministra answers on two paths and installs expose different ones."""
+    tried = []
+
+    def handshake(query):
+        tried.append(len(tried))
+        if len(tried) == 1:
+            raise s.PortalEndpointError("portal returned HTTP 404")
+        return HANDSHAKE
+
+    p = portal({"handshake": handshake, "get_profile": {"js": {"status": 0}}})
+    assert p.login() == "TOK"
+    assert p.url == "http://p.example/server/load.php", p.url
+    # The configured URL is untouched, because logos are resolved against it.
+    assert p.cfg.url == "http://p.example/c/portal.php"
+    assert any("does at" in w for w in p.warnings), p.warnings
+
+
+def test_a_portal_that_is_simply_down_is_not_asked_twice():
+    """Both paths live on one host; a second try buys nothing but delay."""
+    p = portal({"handshake": s.PortalError("request to portal failed: refused")})
+    try:
+        p.login()
+    except s.PortalError as exc:
+        assert "refused" in str(exc), exc
+    assert len([q for q in p.queries if "handshake" in q]) == 1, p.queries
+
+
+def test_when_neither_endpoint_answers_the_configured_one_is_blamed():
+    p = portal({"handshake": s.PortalEndpointError("portal returned HTTP 404")})
+    try:
+        p.login()
+    except s.PortalError as exc:
+        assert "404" in str(exc), exc
+    # Reset, so nothing downstream reports a path the user never wrote.
+    assert p.url == p.cfg.url, p.url
+
+
+def test_the_two_endpoints_map_onto_each_other():
+    cases = {
+        "http://h/c/portal.php": "http://h/server/load.php",
+        "http://h/stalker_portal/c/portal.php": "http://h/stalker_portal/server/load.php",
+        "http://h/server/load.php": "http://h/c/portal.php",
+        "http://h:8080/c/portal.php": "http://h:8080/server/load.php",
+        # Nothing sensible to swap to.
+        "http://h/something.cgi": "",
+    }
+    for given, expected in cases.items():
+        assert s.alternate_endpoint(given) == expected, given
+
+
+def test_there_is_no_watchdog():
+    """Removed rather than left dead: nothing here can call one.
+
+    Keeping a Stalker session warm needs something alive between requests. The
+    sync is a task that ends and the resolver becomes ffmpeg, so a ping method
+    sat uncalled for two releases, reading as a feature that existed.
+    """
+    assert not hasattr(s.Portal, "watchdog")
+
+
 def test_an_auth_error_is_still_a_portal_error():
     """Callers that only catch PortalError must not start leaking exceptions."""
     assert issubclass(s.PortalAuthError, s.PortalError)

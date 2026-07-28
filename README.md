@@ -159,6 +159,11 @@ URL:
 | `http://host/…/load.php` | unchanged — explicit endpoints are preserved |
 | `http://host/c/other.php` | `http://host/c/portal.php` |
 
+If that path turns out not to be where the portal answers, Distalker tries the
+other one Ministra uses — `…/c/portal.php` and `…/server/load.php` are swapped
+for each other — and logs which one worked. Putting the working one on the
+portal line saves a failed request on every sync.
+
 Anything unusual goes in trailing `key=value` pairs, separated by spaces or
 further `|` characters, quoted where a value contains spaces
 (`password="two words"`):
