@@ -62,11 +62,22 @@ CI runs `python3 -m compileall -q .`, then each file in turn, then `./build.sh`.
 ## Building and releasing
 
 ```bash
-./build.sh   # dist/distalker-<version>.zip, version read from plugin.json
+./build.sh        # dist/distalker-<version>.zip, version read from plugin.json
+./build.sh -dev   # dist/distalker-dev.zip, built from the working tree
 ```
 
 It archives from `HEAD`, so **only committed files ship** — what someone
 installs is exactly what the repository says.
+
+`-dev` is for trying a change on a real install before committing it, which some
+of them need: nothing here can be exercised without a Dispatcharr to load it.
+It packs the working tree through a throwaway index rather than zipping the
+directory, so the guarantee that only *tracked* files ship survives — no
+`__pycache__`, no local M3U, no `.claude/`. It carries no version, because it is
+not a release and a ZIP claiming to be 0.9.1 should be the real 0.9.1. The
+archive prefix is still `distalker/`, so Dispatcharr installs it under the usual
+key and replaces whatever is there; restart the container afterwards, since
+plugins load per process.
 
 The `version` in `plugin.json` is a *release* number, not a build counter: leave
 it alone while developing, and raise it when cutting a release. A release is a
@@ -169,10 +180,6 @@ The profile's command is the Python interpreter, not `ffmpeg`, so Dispatcharr's
 command→parser map misses and it falls back to `LogParserFactory.auto_parse`,
 which tries the ffmpeg parser first. Correct by accident, but stable: do not be
 tempted to disguise the command to hit the map.
-
-Nothing reaches a running install by itself: the resolver reads `ffmpeg_args`
-from the *published portal*, so a changed default only lands once
-`_migrate_ffmpeg_args` has run, which means after one action or one event.
 
 ### The plugin is loaded per process, and there are several
 
