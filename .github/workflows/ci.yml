@@ -28,6 +28,9 @@ jobs:
       - name: Authentication state machine test
         run: python3 tests/test_auth.py
 
+      - name: Request transport and retry test
+        run: python3 tests/test_transport.py
+
       - name: Mock portal integration test
         run: python3 tests/test_mock_portal.py
 
