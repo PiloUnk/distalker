@@ -283,6 +283,18 @@ def test_the_default_arguments_let_dispatcharr_fail_over():
     assert micros / 1_000_000 * 3 < 45, "three attempts would outlast the viewer"
 
 
+def test_the_default_arguments_feed_dispatcharrs_statistics():
+    """Nothing probes the stream. Dispatcharr reads the resolution, codecs and
+    bitrate off the stderr of whatever the stream profile spawned -- which is
+    ffmpeg's own, since the resolver execs it -- so the input dump has to be
+    emitted (info level) and the periodic stats line has to be asked for
+    (-stats, which ffmpeg otherwise drops below info). Quieten either and the
+    channel plays with an empty statistics panel and nothing to say why."""
+    args = s.DEFAULT_FFMPEG_ARGS
+    assert "-loglevel info" in args, "the Input #0 / Stream #0:0 dump is info-level"
+    assert "-stats" in args, "the output bitrate comes from the frame= line"
+
+
 def test_a_shipped_default_is_replaced_but_a_choice_is_not():
     for old in s.SUPERSEDED_FFMPEG_ARGS:
         assert s.is_superseded_ffmpeg_args(old)

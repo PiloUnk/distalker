@@ -76,10 +76,11 @@ def migrate_args(settings):
     return result, recorder
 
 
-def test_the_arguments_that_blocked_failover_are_replaced():
+def test_every_default_we_shipped_is_replaced():
     """Changing the manifest default does not reach a value already stored, and
-    one is stored on every install -- so the ffmpeg arguments that kept a dead
-    source alive, and Dispatcharr from switching away from it, are replaced."""
+    one is stored on every install -- so each default this plugin has shipped is
+    replaced: the ones that kept a dead source alive and Dispatcharr from
+    switching away from it, and the one too quiet to report any statistics."""
     import stalker_api as sa
 
     for old in sa.SUPERSEDED_FFMPEG_ARGS:

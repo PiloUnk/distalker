@@ -47,8 +47,8 @@
       "id": "ffmpeg_args",
       "label": "ffmpeg arguments",
       "type": "text",
-      "default": "-hide_banner -loglevel error -user_agent {ua} -referer {referer} -headers {headers} -rw_timeout 10000000 -i {url} -c copy -f mpegts pipe:1",
-      "help_text": "Placeholders: {url} resolved stream, {ua} MAG user agent, {referer} portal origin, {headers} the remaining MAG headers. Must write MPEG-TS to pipe:1. Note the absence of ffmpeg's -reconnect options: they retry a portal link that has already expired, and while they do, Dispatcharr cannot tell the source is dead and will not fail over to the channel's other sources. -rw_timeout gives up on a stalled read after 10 seconds, which is what turns a frozen source into a switch to the next one."
+      "default": "-hide_banner -loglevel info -stats -user_agent {ua} -referer {referer} -headers {headers} -rw_timeout 10000000 -i {url} -c copy -f mpegts pipe:1",
+      "help_text": "Placeholders: {url} resolved stream, {ua} MAG user agent, {referer} portal origin, {headers} the remaining MAG headers. Must write MPEG-TS to pipe:1. Note the absence of ffmpeg's -reconnect options: they retry a portal link that has already expired, and while they do, Dispatcharr cannot tell the source is dead and will not fail over to the channel's other sources. -rw_timeout gives up on a stalled read after 10 seconds, which is what turns a frozen source into a switch to the next one. -loglevel info and -stats are what fill Dispatcharr's stream statistics: it reads them off ffmpeg's own output, so quietening them leaves the channel playing with an empty panel."
     },
     {
       "id": "portal_timeout",

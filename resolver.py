@@ -128,8 +128,11 @@ def build_ffmpeg_command(cfg: stalker_api.PortalConfig, url: str) -> list:
 # Used when no fallback has been published, or when the published one turns out
 # to be unusable. Deliberately plain: a straight remux, no reconnect flags, no
 # MAG headers -- this source is somebody else's and we know nothing about it.
+# The logging is not tuning either: -loglevel info and -stats are what
+# Dispatcharr parses our stderr for, and a source played through here deserves
+# the same statistics panel as a portal one.
 BUILTIN_FALLBACK_ARGS = (
-    "-hide_banner -loglevel error -user_agent {userAgent} -i {streamUrl} "
+    "-hide_banner -loglevel info -stats -user_agent {userAgent} -i {streamUrl} "
     "-c copy -f mpegts pipe:1"
 )
 

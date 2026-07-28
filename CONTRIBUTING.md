@@ -146,6 +146,34 @@ runs in a uWSGI thread, where it is `…/bin/uwsgi`. uWSGI does run the script
 through its embedded interpreter, so this was silent, but nothing should depend
 on it.
 
+### They carry `-loglevel info -stats`, and that is load-bearing too
+
+Dispatcharr never probes a stream. Its statistics panel — resolution, codecs,
+pixel format, FPS, output bitrate — is parsed out of the **stderr of whatever
+the stream profile spawned**: `apps/proxy/live_proxy/input/manager.py` reads the
+pipe and `services/log_parsers.py` matches three shapes. `Input #0, mpegts` and
+`Stream #0:0 … Video:` come from ffmpeg's input dump, which is emitted at info
+level, and the output bitrate comes from the periodic `frame= … bitrate=` line,
+which ffmpeg prints below info only when `-stats` was given explicitly. Quieten
+either and the channel plays with an empty panel and nothing to say why — which
+is what 0.9.1 shipped, hence a third entry in `SUPERSEDED_FFMPEG_ARGS`.
+
+The resolver `exec`s ffmpeg, so that stderr is already the pipe Dispatcharr
+reads: nothing has to be forwarded, and `BUILTIN_FALLBACK_ARGS` carries the same
+two flags so a non-portal source on our channel is not the odd one out. Our own
+`[distalker] …` lines share the pipe and are parsed too; none of them match, and
+they are all written before the `exec`, so they cannot end the input phase
+(`ffmpeg_input_phase`) that gates the video and audio lines.
+
+The profile's command is the Python interpreter, not `ffmpeg`, so Dispatcharr's
+command→parser map misses and it falls back to `LogParserFactory.auto_parse`,
+which tries the ffmpeg parser first. Correct by accident, but stable: do not be
+tempted to disguise the command to hit the map.
+
+Nothing reaches a running install by itself: the resolver reads `ffmpeg_args`
+from the *published portal*, so a changed default only lands once
+`_migrate_ffmpeg_args` has run, which means after one action or one event.
+
 ### The plugin is loaded per process, and there are several
 
 `PluginManager` is a singleton **per process**, and the stock image runs four

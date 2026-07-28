@@ -120,6 +120,15 @@ def test_unparseable_parameters_do_not_kill_the_source():
     assert cmd[0] == "ffmpeg", "a broken profile must still play the stream"
 
 
+def test_the_builtin_command_reports_its_statistics_too():
+    """A source played through here reaches Dispatcharr the same way a portal
+    one does -- as our stderr -- so it gets the same treatment: without these
+    two flags ffmpeg says nothing the statistics panel can be filled from."""
+    cmd = resolver.build_fallback_command(None, XTREAM_URL, "UA")
+    assert "info" in cmd[cmd.index("-loglevel") + 1]
+    assert "-stats" in cmd
+
+
 def test_a_missing_user_agent_is_not_the_literal_placeholder():
     cmd = resolver.build_fallback_command(None, XTREAM_URL, "")
     assert "{userAgent}" not in " ".join(cmd)

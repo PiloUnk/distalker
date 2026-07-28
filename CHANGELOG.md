@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+**Playing**
+
+- Portal channels now fill Dispatcharr's stream statistics — resolution,
+  codecs, pixel format, FPS and output bitrate — like any other source. Nothing
+  probes the stream: Dispatcharr reads those off ffmpeg's own output, and the
+  arguments we shipped were too quiet to say anything. The default gains
+  `-loglevel info -stats`, and is replaced on installs still carrying the old
+  one, unless you wrote your own. Sources played through the fallback command
+  report the same way.
+
 **Licence**
 
 - Distalker is now **AGPL-3.0-only**, the licence Dispatcharr itself uses. The

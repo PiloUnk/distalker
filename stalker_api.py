@@ -73,17 +73,30 @@ STB_KEYS = ("model", "serial", "device_id", "device_id2", "signature", "timezone
 # before moving to the next source and a client gives up at around fifty --
 # three attempts have to fit inside that with room for each portal round-trip.
 # A live stream that goes ten seconds without a byte has already failed.
+#
+# -loglevel info and -stats are what feed Dispatcharr's stream statistics, and
+# they are the only thing that does. Nothing probes the stream: the input
+# manager reads the *stderr of whatever the stream profile spawned* and parses
+# it (apps/proxy/live_proxy/services/log_parsers.py). Since the resolver execs
+# ffmpeg, that stderr is already ours, so the resolution, codecs, pixel format
+# and audio come from ffmpeg's "Input #0 / Stream #0:0" dump, which is emitted
+# at info level, and the output bitrate comes from the periodic "frame= ...
+# bitrate=" line, which ffmpeg only prints below info when -stats is explicit.
+# Quieten either one and the channel plays with an empty stats panel.
 DEFAULT_FFMPEG_ARGS = (
-    "-hide_banner -loglevel error "
+    "-hide_banner -loglevel info -stats "
     "-user_agent {ua} -referer {referer} -headers {headers} "
     "-rw_timeout 10000000 "
     "-i {url} -c copy -f mpegts pipe:1"
 )
 
-# Defaults this plugin shipped before 0.9.1, replaced on sight because they
-# defeat that failover. Two of them: the manifest's copy had drifted from the
-# code's and lost the MAG headers, and a background sync persisted whichever it
-# was holding.
+# Defaults this plugin shipped and now replaces on sight, oldest first. The two
+# from before 0.9.1 defeat the failover above; they are two rather than one
+# because the manifest's copy had drifted from the code's and lost the MAG
+# headers, and a background sync persisted whichever it was holding. The third
+# is 0.9.1's own, silent enough that Dispatcharr could read no statistics off
+# it. Changing the manifest default does not reach a value already stored, and
+# one is stored on every install, so they are replaced here instead.
 SUPERSEDED_FFMPEG_ARGS = (
     "-hide_banner -loglevel error -user_agent {ua} -referer {referer} "
     "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 "
@@ -91,6 +104,10 @@ SUPERSEDED_FFMPEG_ARGS = (
     "-hide_banner -loglevel error -user_agent {ua} -referer {referer} "
     "-headers {headers} "
     "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 "
+    "-i {url} -c copy -f mpegts pipe:1",
+    "-hide_banner -loglevel error "
+    "-user_agent {ua} -referer {referer} -headers {headers} "
+    "-rw_timeout 10000000 "
     "-i {url} -c copy -f mpegts pipe:1",
 )
 
