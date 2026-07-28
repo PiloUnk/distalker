@@ -31,6 +31,9 @@ jobs:
       - name: Request transport and retry test
         run: python3 tests/test_transport.py
 
+      - name: Channel listing and paging test
+        run: python3 tests/test_listing.py
+
       - name: Mock portal integration test
         run: python3 tests/test_mock_portal.py
 
