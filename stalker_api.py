@@ -945,6 +945,17 @@ class ChannelEntry:
     logo: str = ""
     genre_id: str = ""
     number: str = ""
+    # Catch-up, as the portal advertises it. Read but not yet published:
+    # Dispatcharr does pick these up from an M3U -- it turns 'tv_archive' and
+    # 'tv_archive_duration' attributes into a stream's is_catchup and
+    # catchup_days -- but playing one back is Xtream-only, built from a
+    # server URL and credentials this plugin's sources do not have
+    # (apps/timeshift/helpers.py). Emitting them would light up a catch-up
+    # badge on channels whose catch-up cannot play, which is worse than not
+    # offering it. Captured here so the day that path stops being
+    # Xtream-shaped, the data is already arriving.
+    tv_archive: bool = False
+    tv_archive_duration: str = ""
 
 
 class Portal:
@@ -1335,23 +1346,35 @@ class Portal:
 
         channels: List[ChannelEntry] = []
         for row in rows:
-            if not isinstance(row, dict):
-                continue
-            cmd = str(row.get("cmd") or "").strip()
-            name = str(row.get("name") or "").strip()
-            if not cmd or not name:
-                continue
-            channels.append(
-                ChannelEntry(
-                    channel_id=str(row.get("id") or ""),
-                    name=name,
-                    cmd=cmd,
-                    logo=str(row.get("logo") or ""),
-                    genre_id=str(row.get("tv_genre_id") or ""),
-                    number=str(row.get("number") or ""),
-                )
-            )
+            channel = self._channel_from_row(row)
+            if channel is not None:
+                channels.append(channel)
         return channels
+
+    @staticmethod
+    def _channel_from_row(row: Any) -> Optional[ChannelEntry]:
+        """One row of a channel listing, or None when it is not usable.
+
+        A row without a name or without a command is not a channel this plugin
+        can do anything with, and portals do emit them.
+        """
+        if not isinstance(row, dict):
+            return None
+        cmd = str(row.get("cmd") or "").strip()
+        name = str(row.get("name") or "").strip()
+        if not cmd or not name:
+            return None
+        return ChannelEntry(
+            channel_id=str(row.get("id") or ""),
+            name=name,
+            cmd=cmd,
+            logo=str(row.get("logo") or ""),
+            genre_id=str(row.get("tv_genre_id") or ""),
+            number=str(row.get("number") or ""),
+            # Portals write these as 1/0, and sometimes as "1"/"0".
+            tv_archive=str(row.get("enable_tv_archive") or "0") not in ("0", ""),
+            tv_archive_duration=str(row.get("tv_archive_duration") or ""),
+        )
 
     def create_link(self, cmd: str) -> str:
         """Ask the portal for a playable URL for ``cmd``.
@@ -1387,10 +1410,24 @@ class Portal:
         return link
 
     def logo_url(self, logo: str) -> str:
-        """Absolute URL for a channel logo, or '' when there isn't one."""
+        """Absolute URL for a channel logo, or '' when there isn't one.
+
+        Two shapes beyond the obvious, both from pvr.stalker's
+        ``DetermineLogoURI``, both seen in the wild:
+
+        * an inline ``data:`` image, which is dropped. It is a valid logo and a
+          useless one here -- Dispatcharr stores this in a URL field, and a
+          base64 payload has no business in an M3U attribute.
+        * any scheme at all, not just http(s). A portal serving its logos from
+          somewhere else says so with a scheme, and treating that as a filename
+          produced a URL that pointed nowhere.
+        """
+        logo = (logo or "").strip()
         if not logo:
             return ""
-        if logo.startswith(("http://", "https://")):
+        if logo[:5].lower() == "data:":
+            return ""
+        if "://" in logo:
             return logo
         parsed = urlparse(self.cfg.url)
         base_dir = parsed.path.rsplit("/", 1)[0] or ""

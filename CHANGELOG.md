@@ -35,6 +35,11 @@
 
 **Syncing**
 
+- Channel logos survive two shapes that used to come out broken: a logo served
+  from another scheme than `http(s)` was treated as a filename and glued behind
+  the portal's logo path, and an inline `data:` image got the same treatment.
+  The first is now left alone, the second dropped — Dispatcharr keeps this in a
+  URL field, where a base64 payload does not belong.
 - **A sync survives a portal having a bad minute.** Requests made while
   syncing are attempted up to three times, one then two then four seconds
   apart, where a single dropped connection or gateway error used to cost the

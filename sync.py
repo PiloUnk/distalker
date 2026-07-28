@@ -67,6 +67,10 @@ def build_m3u(
     ``group-title`` carries the portal's own genre, which is what Dispatcharr
     turns into Channel Groups -- so the existing M3U Accounts / Groups UI does
     all the filtering, and this plugin does none.
+
+    Catch-up is deliberately not advertised here even though the portal tells
+    us about it and Dispatcharr would read it -- see ``ChannelEntry`` for why
+    the badge would be a promise nothing can keep.
     """
     slug = portal.cfg.slug
     lines = ["#EXTM3U"]
