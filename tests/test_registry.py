@@ -44,7 +44,7 @@ plugin_mod = load_plugin_module()
 import registry  # noqa: E402
 import stalker_api as s  # noqa: E402
 
-PORTAL = "weaseltv | http://weaseltv.live/c/ | 00:1A:79:29:53:38 | max_streams=1\n"
+PORTAL = "livingroom | http://portal.example/c/ | 00:1A:79:AA:BB:CC | max_streams=1\n"
 
 
 class NullLogger:
@@ -87,15 +87,15 @@ def test_absent_key_means_clobbered_and_is_restored():
     registry.save_registry(PORTAL)
 
     # The panel POSTed a state captured before the portal existed: no key at all.
-    p, store = make_plugin({"new_name": "weaseltv"})
-    merged = {"new_name": "weaseltv", "portals": ""}   # defaults merged by the loader
+    p, store = make_plugin({"new_name": "livingroom"})
+    merged = {"new_name": "livingroom", "portals": ""}   # defaults merged by the loader
 
     result = p._reconcile_registry(merged, NullLogger())
 
     assert result["portals"] == PORTAL, "the clobbered list must come back"
     assert store["settings"]["portals"] == PORTAL, "and be written back to the DB"
     portals, errors = s.parse_portals(result["portals"])
-    assert not errors and [x.name for x in portals] == ["weaseltv"]
+    assert not errors and [x.name for x in portals] == ["livingroom"]
 
 
 def test_hand_edited_textarea_wins():
@@ -162,7 +162,7 @@ def test_add_then_stale_click_does_not_lose_the_portal():
     assert registry.load_registry() == PORTAL
 
     # 2. The panel, still holding its pre-add state, overwrites settings.
-    store["settings"] = {"new_name": "weaseltv", "new_url": "http://weaseltv.live/c/"}
+    store["settings"] = {"new_name": "livingroom", "new_url": "http://portal.example/c/"}
 
     # 3. The user clicks another action.
     result = p._reconcile_registry(dict(store["settings"], portals=""), NullLogger())
@@ -183,8 +183,8 @@ def test_stale_empty_textarea_does_not_erase_the_list():
 
     # The panel PUTs the state it captured at page load, textarea and all.
     store["settings"] = {
-        "new_name": "weaseltv",
-        "new_url": "http://weaseltv.live/c/",
+        "new_name": "livingroom",
+        "new_url": "http://portal.example/c/",
         "portals": "",
     }
 

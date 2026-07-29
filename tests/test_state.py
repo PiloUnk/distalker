@@ -26,10 +26,10 @@ sys.path.insert(0, REPO)
 import stalker_api as s  # noqa: E402
 
 CFG = s.PortalConfig(
-    slug="weasel-tv",
-    name="Weasel TV",
-    url="http://weaseltv.live/c/",
-    mac="00:1A:79:29:53:38",
+    slug="livingroom",
+    name="Living Room",
+    url="http://portal.example/c/",
+    mac="00:1A:79:AA:BB:CC",
     username="jo",
     password="hunter2",
     timeout=90,

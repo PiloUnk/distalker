@@ -116,7 +116,7 @@ def run(p, action, settings):
     return p.run(action, {}, {"settings": dict(settings), "logger": NullLogger()})
 
 
-PORTALS = "http://weaseltv.live/c/ | 00:1A:79:29:53:38\n"
+PORTALS = "http://portal.example/c/ | 00:1A:79:AA:BB:CC\n"
 
 
 @contextlib.contextmanager
@@ -256,7 +256,7 @@ def test_settings_never_travel_back_in_the_result():
     p, store, _ = make_plugin({})
     try:
         result = run(p, "sync_now", {
-            "portals": "http://weaseltv.live/c/ | 00:1A:79:29:53:38 | password=hunter2"
+            "portals": "http://portal.example/c/ | 00:1A:79:AA:BB:CC | password=hunter2"
         })
         assert "settings" not in result
         assert "hunter2" not in json.dumps(result)
@@ -501,7 +501,7 @@ def test_assigning_the_profile_also_republishes_the_portals():
             {"event": "channel_error", "payload": {}},
             {"settings": dict(store["settings"]), "logger": NullLogger()},
         )
-        assert published == ["weaseltv"]
+        assert published == ["portal"]
     finally:
         (plugin_mod.apply_stream_profile, plugin_mod.save_portal,
          plugin_mod.publish_fallback) = originals
