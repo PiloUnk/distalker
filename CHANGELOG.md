@@ -48,6 +48,10 @@ credentials will say so.
 - Channels the portal has no programmes for are left out rather than written as
   empty entries, and removing `epg=1` deactivates the EPG source instead of
   deleting it.
+- **Only whole-grid guides are read.** A portal that serves programmes one
+  channel at a time is reported as having no guide — which, measured across
+  twelve portals, is close to the truth: that route covered none of the
+  channels anyone had configured, at the price of one request per channel.
 - A portal with no guide says so plainly and suggests removing `epg=1`, rather
   than reporting the same message as a portal that answered with something
   unrecognisable — which is now reported as exactly that, and asks to be.

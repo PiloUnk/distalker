@@ -380,6 +380,13 @@ deleting it.
 ## Limitations
 
 - **Live TV only.** No VOD, no series.
+- **Programme guides are supported only where a portal serves a whole grid.**
+  `get_epg_info` answers for the entire line-up in one request, and that is the
+  only shape Distalker reads. Portals that instead serve a guide one channel at
+  a time are not covered: it costs one request per channel, and where it was
+  measured across twelve portals it covered none of the channels that had
+  actually been configured. Those portals report having no guide, which for
+  practical purposes is what it amounts to.
 - **Scheduling is borrowed, not built.** A plugin cannot register a Celery task
   a stock Dispatcharr can run, so *Refresh every (hours)* drives the M3U
   accounts' own refresh interval and answers the event that follows. It works,
