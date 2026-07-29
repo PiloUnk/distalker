@@ -293,7 +293,7 @@ def distalker_accounts():
     )
 
 
-def upsert_account(cfg: PortalConfig, file_path: str):
+def upsert_account(cfg: PortalConfig, file_path: str, refresh_hours: int = 0):
     """Create or update the M3U account backing one portal.
 
     Dispatcharr supports file-backed accounts as a first-class refresh source
@@ -322,9 +322,14 @@ def upsert_account(cfg: PortalConfig, file_path: str):
     # Portals typically allow a single connection per MAC; exceeding it is the
     # fastest way to get the account blocked.
     account.max_streams = cfg.max_streams
-    # We regenerate the file ourselves before every refresh, so Dispatcharr
-    # scheduling its own re-parse of a stale file would only cause confusion.
-    account.refresh_interval = 0
+    # Dispatcharr's own schedule, turned into ours. Left at 0 the account is
+    # never re-read on its own and every fetch is a button press -- which is
+    # what this plugin did for its whole life, because a plugin cannot register
+    # a Celery task of its own (see tasks.py). Set, Dispatcharr creates and
+    # runs the periodic task itself, and the m3u_refresh it ends with is what
+    # calls the plugin back to re-fetch the portal. The clock is borrowed
+    # rather than built.
+    account.refresh_interval = max(0, int(refresh_hours or 0))
 
     properties = dict(account.custom_properties or {})
     properties[MARKER_KEY] = {"slug": cfg.slug, "portal": cfg.url}
@@ -403,6 +408,37 @@ def deactivate_epg_source(cfg: PortalConfig) -> bool:
     return True
 
 
+def request_reparse(account_id: int, refresh_hours: int) -> str:
+    """Ask Dispatcharr to read the playlist just written. Returns which task.
+
+    **Exactly one task, never both.** ``refresh_single_m3u_account`` refreshes
+    the groups itself, so dispatching ``refresh_m3u_groups`` alongside it puts
+    the pair in a race for the same per-account lock -- and the loser reports
+    "Failed to refresh M3U groups" at the user, leaving the account in Pending
+    Setup. Which is worth stating in a function of its own, because the two
+    calls read as complementary and are not.
+
+    Off a schedule, only the groups are refreshed: that has been this plugin's
+    behaviour throughout, and importing the streams is a step the user
+    completes by choosing groups.
+
+    On a schedule, the whole account is re-read instead. Dispatcharr looked at
+    the *previous* playlist moments ago -- that refresh is what woke us to
+    write this one -- so without this the channel list would sit one cycle
+    behind the portal for ever. It emits ``m3u_refresh`` again, which is the
+    event that brought us here; the cooldown claimed before the sync started is
+    what keeps that from going round for ever.
+    """
+    from apps.m3u.tasks import refresh_m3u_groups, refresh_single_m3u_account
+
+    if refresh_hours:
+        refresh_single_m3u_account.delay(account_id)
+        return "refresh_single_m3u_account"
+
+    refresh_m3u_groups.delay(account_id)
+    return "refresh_m3u_groups"
+
+
 def refresh_epg_source(source_id: int) -> None:
     """Ask Dispatcharr to read the guide we just wrote.
 
@@ -413,6 +449,39 @@ def refresh_epg_source(source_id: int) -> None:
     from apps.epg.tasks import refresh_epg_data
 
     refresh_epg_data.delay(source_id)
+
+
+def apply_refresh_interval(refresh_hours: int, logger) -> int:
+    """Put the schedule on every account this plugin owns, without fetching.
+
+    ``upsert_account`` writes the interval too, but only for portals a sync
+    actually fetched -- and changing the schedule changes nothing about any
+    portal, so the plan calls them all unchanged and fetches none of them. The
+    setting would appear to do nothing until the next unrelated re-fetch.
+
+    So it is applied here instead, on every sync, for every account: a handful
+    of small updates and no network at all.
+    """
+    wanted = max(0, int(refresh_hours or 0))
+    changed = 0
+    try:
+        for account in distalker_accounts():
+            if account.refresh_interval != wanted:
+                account.refresh_interval = wanted
+                account.save(update_fields=["refresh_interval"])
+                changed += 1
+    except Exception:
+        logger.debug("distalker: could not apply the refresh schedule", exc_info=True)
+        return 0
+
+    if changed:
+        logger.info(
+            "distalker: %s on %d M3U account(s)",
+            f"scheduled refresh set to every {wanted}h" if wanted
+            else "scheduled refresh switched off",
+            changed,
+        )
+    return changed
 
 
 def announce_new_account(account_id: int) -> None:
@@ -666,7 +735,12 @@ def apply_stream_profile() -> Dict[str, int]:
 SYNC_RETRIES = 2
 
 
-def sync_portal(cfg: PortalConfig, logger, trigger_refresh: bool = True) -> Dict[str, Any]:
+def sync_portal(
+    cfg: PortalConfig,
+    logger,
+    trigger_refresh: bool = True,
+    refresh_hours: int = 0,
+) -> Dict[str, Any]:
     """Full sync for one portal: log in, fetch, write M3U, refresh account."""
     portal = Portal(cfg, retries=SYNC_RETRIES)
     portal.login()
@@ -690,13 +764,11 @@ def sync_portal(cfg: PortalConfig, logger, trigger_refresh: bool = True) -> Dict
     save_portal(cfg)
 
     path = write_m3u(cfg.slug, build_m3u(portal, channels, genres))
-    account, account_created = upsert_account(cfg, path)
+    account, account_created = upsert_account(cfg, path, refresh_hours)
     record_expiry(account, snapshot["expires"])
 
     if trigger_refresh:
-        from apps.m3u.tasks import refresh_m3u_groups
-
-        refresh_m3u_groups.delay(account.id)
+        request_reparse(account.id, refresh_hours)
 
     logger.info(
         "distalker: synced '%s' -- %d channels in %d groups -> %s",
@@ -818,14 +890,24 @@ def _scratch_dir() -> Optional[str]:
         return None
 
 
-def sync_all(portals: List[PortalConfig], logger, trigger_refresh: bool = True) -> Dict[str, Any]:
+def sync_all(
+    portals: List[PortalConfig],
+    logger,
+    trigger_refresh: bool = True,
+    refresh_hours: int = 0,
+) -> Dict[str, Any]:
     """Sync every configured portal, surviving individual failures."""
     results: List[Dict[str, Any]] = []
     errors: List[str] = []
 
     for cfg in portals:
         try:
-            results.append(sync_portal(cfg, logger, trigger_refresh=trigger_refresh))
+            results.append(
+                sync_portal(
+                    cfg, logger, trigger_refresh=trigger_refresh,
+                    refresh_hours=refresh_hours,
+                )
+            )
         except PortalError as exc:
             errors.append(f"{cfg.name}: {exc}")
             logger.error("distalker: sync failed for '%s': %s", cfg.name, exc)

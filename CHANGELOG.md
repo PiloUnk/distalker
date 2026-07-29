@@ -8,6 +8,20 @@ against what was last published, and none of them changed — only the code did.
 Test first, since it writes nothing and is where a portal that now needs
 credentials will say so.
 
+**Refreshing by itself**
+
+- **Distalker can now be put on a schedule.** Set *Refresh every (hours)* and
+  each portal is re-fetched on that interval — channels, and the guide where
+  `epg=1` is set — without anyone pressing Sync. Left at `0`, nothing changes:
+  everything stays manual, as before.
+- The clock is Dispatcharr's, not ours. A plugin cannot register a Celery task
+  a stock install can consume, so the setting drives the refresh interval of
+  the M3U accounts this plugin owns, and the event Dispatcharr emits at the end
+  of each refresh is what calls back to re-fetch the portal.
+- Refreshing an M3U account that is not one of ours does nothing, and a
+  scheduled run cannot follow another within thirty minutes — the second is the
+  echo of the first, and answering it would loop.
+
 **Guide**
 
 - **Distalker can now fetch a portal's programme guide.** Add `epg=1` to a

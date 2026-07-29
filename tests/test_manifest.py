@@ -51,10 +51,17 @@ FIELD_TYPES = {"boolean", "number", "string", "text", "select", "info"}
 
 
 class NullLogger:
-    def info(self, *a, **k): pass
-    def warning(self, *a, **k): pass
-    def error(self, *a, **k): pass
-    def exception(self, *a, **k): pass
+    """Swallows anything a logger is asked to do.
+
+    A catch-all rather than a list of methods: naming them one by one means a
+    handler that reaches for a level nobody thought of raises AttributeError
+    *inside* run()'s own except clause, and the failure surfaces as the action
+    reporting something unrelated -- which is a long way to travel to discover
+    that a stub was missing a method.
+    """
+
+    def __getattr__(self, _name):
+        return lambda *a, **k: None
 
 
 class FakeTasks:

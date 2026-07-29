@@ -325,6 +325,24 @@ dates natively. If the portal reports the account as blocked, the line says so
 in capitals: a blocked account otherwise looks exactly like an empty channel
 list.
 
+### Refreshing on a schedule
+
+Set **Refresh every (hours)** and Distalker re-fetches every portal on that
+interval — channels, and the guide on lines carrying `epg=1`. At `0`, the
+default, nothing happens on its own and Sync stays a button.
+
+There is no timer inside the plugin. The setting is written to the refresh
+interval of the M3U accounts it owns; Dispatcharr schedules those itself, and
+the event it emits after each one is what wakes Distalker to re-fetch the
+portal behind it. Two consequences worth knowing:
+
+- **Below one hour is refused.** A scheduled run blocks the next for thirty
+  minutes, because a sync ends by asking Dispatcharr to re-read the playlist it
+  just wrote — and that re-read emits the same event. The cooldown is what
+  stops the pair going round for ever.
+- Refreshing an M3U account by hand also triggers it, if the account is one of
+  Distalker's and the last scheduled run was over half an hour ago.
+
 ### Programme guide
 
 Add `epg=1` to a portal line and the next sync also fetches its guide, writes
@@ -362,8 +380,10 @@ deleting it.
 ## Limitations
 
 - **Live TV only.** No VOD, no series.
-- **The guide is fetched, never scheduled on its own.** It refreshes when you
-  press Sync, like everything else this plugin does.
+- **Scheduling is borrowed, not built.** A plugin cannot register a Celery task
+  a stock Dispatcharr can run, so *Refresh every (hours)* drives the M3U
+  accounts' own refresh interval and answers the event that follows. It works,
+  and it is why the interval cannot usefully go below an hour.
 - **Credentials are stored unencrypted**, in the Dispatcharr database and on
   disk — see [What it writes, and where](#what-it-writes-and-where).
 - **No session keep-alive.** A cached token is reused and re-issued on demand.

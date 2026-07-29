@@ -39,6 +39,7 @@ from .stalker_api import (
     STB_KEYS,
     PortalConfig,
     PortalError,
+    claim_auto_sync,
     forget_portal,
     format_portal_line,
     is_superseded_ffmpeg_args,
@@ -51,7 +52,9 @@ from .stalker_api import (
 )
 
 from .sync import (
+    ACCOUNT_PREFIX,
     announce,
+    apply_refresh_interval,
     apply_stream_profile,
     install_stream_profile,
     portal_status,
@@ -70,6 +73,13 @@ LEGACY_STB_SETTINGS = {
     "stb_signature": "signature",
     "stb_timezone": "timezone",
 }
+
+# How long a scheduled sync blocks the next one. It has to outlast the sync it
+# guards, because that sync ends by asking Dispatcharr to re-read the playlist
+# it wrote -- which emits the event that started it. Thirty minutes is chosen
+# against a large portal with a guide, and is why the schedule cannot usefully
+# be finer than an hour.
+AUTO_SYNC_COOLDOWN = 1800
 
 _MANIFEST_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "plugin.json")
 
@@ -561,19 +571,84 @@ class Plugin:
         return {"status": "ok", "message": "sync started: " + self._describe(plan)}
 
     def _action_resync_all(self, params, settings, logger) -> Dict[str, Any]:
-        """Re-fetch every portal, changed or not."""
+        """Re-fetch every portal, changed or not.
+
+        A button, and also the plugin's clock. It subscribes to ``m3u_refresh``
+        because that is the only periodic thing a plugin can be woken by:
+        Dispatcharr schedules a refresh per M3U account, and the event it ends
+        with reaches here -- see :meth:`_scheduled_run_wanted` for the three
+        things that have to be true before an event is allowed to act on it.
+
+        A full re-fetch rather than a planned one, deliberately. The plan
+        compares the portal list against what is published, and on a schedule
+        nothing in the list has changed -- so a planned run would find nothing
+        to do every single time, which is the opposite of a refresh.
+        """
+        if params.get("event"):
+            reason = self._scheduled_run_wanted(params, settings, logger)
+            if reason:
+                return {"status": "ok", "message": reason, "changed": False}
+
         portals = self._portals(settings)
 
         if not tasks.run_sync_in_background(full=True):
-            return {"status": "ok", "message": self._already_running()}
+            return {"status": "ok", "message": self._already_running(), "changed": False}
 
         return {
             "status": "ok",
+            "changed": True,
             "message": (
                 f"re-fetching all {len(portals)} portal(s) in the background. Refresh "
                 "the Plugins page to read the result in Last action."
             ),
         }
+
+    def _scheduled_run_wanted(self, params, settings, logger) -> str:
+        """Why this event should be ignored, or '' to let it through.
+
+        Three guards, each covering something different:
+
+        * the setting. ``refresh_hours`` at 0 means the user never asked to be
+          synced on a schedule, and a plugin that starts contacting portals by
+          itself after an upgrade is not a good surprise.
+        * whose account it was. ``m3u_refresh`` fires for *every* M3U account on
+          the install, so without this a user refreshing an unrelated playlist
+          would set off a full round of portal logins.
+        * the cooldown. A scheduled sync ends by asking Dispatcharr to re-read
+          the playlist it just wrote, and that re-read emits this same event --
+          so the ring has to be broken somewhere, and this is where.
+        """
+        if self._refresh_hours(settings) <= 0:
+            return "scheduled refresh is off"
+
+        payload = params.get("payload") or {}
+        account = str(payload.get("account_name") or "")
+        if not account.startswith(ACCOUNT_PREFIX):
+            return f"'{account}' is not one of ours"
+
+        # Long enough to outlast the sync it is guarding, which on a large
+        # portal with a guide is minutes rather than seconds.
+        if not claim_auto_sync(ttl=AUTO_SYNC_COOLDOWN):
+            return "a scheduled sync ran too recently"
+
+        logger.info(
+            "distalker: '%s' refreshed on schedule; re-fetching every portal", account
+        )
+        return ""
+
+    @staticmethod
+    def _refresh_hours(settings: Dict[str, Any]) -> int:
+        """The schedule in hours, or 0. Never less than an hour when set.
+
+        Below that the cooldown that stops the refresh loop would be longer than
+        the interval, so every other run would be swallowed -- a schedule that
+        silently does half of what it says.
+        """
+        try:
+            hours = int(settings.get("refresh_hours") or 0)
+        except (TypeError, ValueError):
+            return 0
+        return max(1, hours) if hours > 0 else 0
 
     @staticmethod
     def _already_running() -> str:
@@ -647,8 +722,13 @@ class Plugin:
         for cfg in portals:
             save_portal(cfg)
 
+        # Before the fetch, and regardless of it: the schedule is a global
+        # setting, so no portal ever looks "changed" because of it and the
+        # plan would leave every account untouched.
+        apply_refresh_interval(self._refresh_hours(settings), logger)
+
         targets = portals if full else plan["new"] + plan["changed"]
-        outcome = sync_all(targets, logger)
+        outcome = sync_all(targets, logger, refresh_hours=self._refresh_hours(settings))
 
         # Portals the user deleted stop resolving. Their M3U account and
         # channels stay: deleting those is a decision, not a side effect.
@@ -793,6 +873,12 @@ class Plugin:
             publish_fallback(settings.get("fallback_profile") or "")
         except Exception:
             logger.exception("distalker: could not republish the fallback profile")
+
+        # Here rather than only in _sync_portals, because the path that most
+        # needs it never gets there: changing the schedule changes no portal,
+        # so Sync finds nothing to fetch, returns early -- and returns through
+        # this function. Idempotent, and it writes only when the value differs.
+        apply_refresh_interval(self._refresh_hours(settings), logger)
 
         return published
 

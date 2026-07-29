@@ -896,6 +896,37 @@ def claim_sync_lock(token: str, ttl: int = 1800, client=None) -> Optional[bool]:
         return None
 
 
+def _auto_sync_key() -> str:
+    return f"{REDIS_PREFIX}:auto_sync"
+
+
+def claim_auto_sync(ttl: int = 1800, client=None) -> bool:
+    """Claim the right to start a sync from a scheduled refresh.
+
+    Load-bearing rather than defensive. A scheduled sync ends by asking
+    Dispatcharr to re-read the playlist it just wrote, and that re-read emits
+    the very event that started it -- so without a cooldown the two would take
+    turns forever, each round costing a login and a full channel download on a
+    MAC most providers allow one connection for.
+
+    The TTL is what breaks the ring: it has to outlast a sync, which on a large
+    portal with a guide is minutes, so the schedule cannot usefully be finer
+    than an hour either way.
+
+    Returns True when the caller may proceed. Redis being unreachable answers
+    False -- the opposite of :func:`claim_sync_lock`, and deliberately: that one
+    protects a button the user just pressed and should not refuse on a cache
+    outage, this one protects against a loop that nobody asked for.
+    """
+    client = _client_or_none(client)
+    if client is None:
+        return False
+    try:
+        return bool(client.set(_auto_sync_key(), "1", nx=True, ex=max(60, int(ttl))))
+    except Exception:
+        return False
+
+
 def release_sync_lock(token: str, client=None) -> None:
     """Release the lock, but only while it is still ours.
 
