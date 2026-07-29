@@ -65,30 +65,41 @@ class Recorder:
     def __init__(self, started=True):
         self.plugin = plugin_mod.Plugin.__new__(plugin_mod.Plugin)
         self.calls = []
+        self.loggers = []
+        self.re_asked = []
         self.started = started
 
     def resync(self, params, settings):
         """Both routes stubbed: a click threads it, an event runs it here."""
         originals = (plugin_mod.tasks.run_sync_in_background,
                      plugin_mod.tasks.run_sync_here,
+                     plugin_mod.request_reparse_later,
                      plugin_mod.Plugin._portals)
+        logger = _Logger()
 
         def fake_thread(full=False):
             self.calls.append(("threaded", full))
             return self.started
 
-        def fake_here(full=False):
+        def fake_here(full=False, logger=None):
             self.calls.append(("here", full))
+            self.loggers.append(logger)
             return {"message": "done"} if self.started else None
+
+        def fake_later(account_name, delay=None):
+            self.re_asked.append(account_name)
+            return True
 
         plugin_mod.tasks.run_sync_in_background = fake_thread
         plugin_mod.tasks.run_sync_here = fake_here
+        plugin_mod.request_reparse_later = fake_later
         plugin_mod.Plugin._portals = lambda self, settings: []
         try:
-            return self.plugin._action_resync_all(params, settings, _Logger())
+            return self.plugin._action_resync_all(params, settings, logger)
         finally:
             (plugin_mod.tasks.run_sync_in_background,
              plugin_mod.tasks.run_sync_here,
+             plugin_mod.request_reparse_later,
              plugin_mod.Plugin._portals) = originals
 
 
@@ -234,6 +245,65 @@ def test_a_scheduled_sync_reports_what_it_actually_did():
         result = rec.resync(event(), {"refresh_hours": 6})
         assert result["message"] == "done", result
         assert "background" not in result["message"], result
+    finally:
+        restore()
+
+
+def test_the_scheduled_sync_is_given_a_logger_that_prints():
+    """The whole run went to nowhere, and looked exactly like no run at all.
+
+    ``logging.getLogger(__name__)`` inside the plugin reaches the container
+    log from a uWSGI worker and not from a Celery one -- so every 'synced'
+    line ever recorded came from the button, and the scheduled path wrote its
+    channel counts, its guide sizes and its failures to a logger with nowhere
+    to put them. Twice that absence was read as a schedule that never fired.
+    Dispatcharr's own logger, handed to every action, prints from both.
+    """
+    client, restore = fresh_redis()
+    try:
+        rec = Recorder()
+        rec.resync(event(), {"refresh_hours": 6})
+        assert rec.loggers and rec.loggers[0] is not None, rec.loggers
+        assert isinstance(rec.loggers[0], _Logger), rec.loggers
+    finally:
+        restore()
+
+
+def test_the_account_that_woke_us_is_asked_for_again():
+    """It is the one account whose playlist our own sync cannot get re-read.
+
+    We run inside Dispatcharr's refresh task for it, which holds that
+    account's lock for as long as we do, so the request made mid-sync is
+    refused. Unasked, that portal is downloaded every cycle and read one cycle
+    late for ever -- a day late on a daily schedule.
+    """
+    client, restore = fresh_redis()
+    try:
+        rec = Recorder()
+        rec.resync(event(account="Distalker: Mock"), {"refresh_hours": 6})
+        assert rec.re_asked == ["Distalker: Mock"], rec.re_asked
+    finally:
+        restore()
+
+
+def test_a_button_press_asks_nobody_for_a_second_reading():
+    """No task of ours holds a lock when the sync came from a click."""
+    client, restore = fresh_redis()
+    try:
+        rec = Recorder()
+        rec.resync({}, {"refresh_hours": 6})
+        assert rec.re_asked == [], rec.re_asked
+    finally:
+        restore()
+
+
+def test_a_scheduled_sync_that_stood_down_asks_for_nothing():
+    """Nothing was written, so there is nothing to have re-read."""
+    client, restore = fresh_redis()
+    try:
+        rec = Recorder(started=False)
+        rec.resync(event(), {"refresh_hours": 6})
+        assert rec.re_asked == [], rec.re_asked
     finally:
         restore()
 

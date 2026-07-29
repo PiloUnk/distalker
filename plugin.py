@@ -53,12 +53,14 @@ from .stalker_api import (
 
 from .sync import (
     ACCOUNT_PREFIX,
+    TRIGGER_REPARSE_DELAY,
     announce,
     apply_refresh_interval,
     apply_stream_profile,
     install_stream_profile,
     portal_status,
     publish_fallback,
+    request_reparse_later,
     sync_all,
     test_portal,
 )
@@ -594,7 +596,7 @@ class Plugin:
             # scales down -- see tasks.run_sync_here. Running it where we
             # stand also means the report is the real one rather than a
             # promise that something has started.
-            result = tasks.run_sync_here(full=True)
+            result = tasks.run_sync_here(full=True, logger=logger)
             if result is None:
                 # Said out loud, because this is the one outcome that used to
                 # leave no trace at all: an event run that changes nothing is
@@ -606,6 +608,8 @@ class Plugin:
                 )
                 return {"status": "ok", "message": self._already_running(),
                         "changed": False}
+
+            self._reparse_the_account_that_woke_us(params, logger)
             return {"status": "ok", "message": result["message"], "changed": True}
 
         portals = self._portals(settings)
@@ -621,6 +625,31 @@ class Plugin:
                 "the Plugins page to read the result in Last action."
             ),
         }
+
+    def _reparse_the_account_that_woke_us(self, params, logger) -> None:
+        """Ask again for the one playlist the sync could not get re-read.
+
+        Here rather than in the sync, because it is the event path that knows
+        which account is the awkward one, and because by now the sync has
+        returned -- there is nothing left of our work for the lock to outlast.
+        See sync.request_reparse_later for what the lock is and why it refuses.
+        """
+        account = str((params.get("payload") or {}).get("account_name") or "")
+        try:
+            if request_reparse_later(account):
+                logger.info(
+                    "distalker: asking again in %ds for '%s' to be re-read -- "
+                    "its own refresh is what woke us, so it held the lock while "
+                    "we worked",
+                    TRIGGER_REPARSE_DELAY,
+                    account,
+                )
+        except Exception:
+            # Never worth failing a completed sync over: the playlist is
+            # written either way, and the next cycle reads it.
+            logger.debug(
+                "distalker: could not re-ask for '%s'", account, exc_info=True
+            )
 
     def _scheduled_run_wanted(self, params, settings, logger) -> str:
         """Why this event should be ignored, or '' to let it through.
@@ -699,13 +728,21 @@ class Plugin:
             parts.append(f"leaving {len(plan['unchanged'])} untouched")
         return "; ".join(parts) + ". Refresh the Plugins page for the result."
 
-    def run_sync_now(self, full: bool = False) -> Dict[str, Any]:
+    def run_sync_now(self, full: bool = False, logger=None) -> Dict[str, Any]:
         """The sync itself, off the request thread. Entry point for the thread.
 
         Loads its own settings, because a background thread has no request
         context and no panel state to be handed.
+
+        The caller may hand its logger over, and the scheduled path does.
+        Ours -- ``_dispatcharr_plugin_distalker.plugin`` -- reaches the
+        container log from a uWSGI worker and not from a Celery one, so a
+        scheduled sync wrote its whole run to nowhere: no 'synced' line, no
+        channel counts, nothing to tell a working refresh from one that never
+        happened. Dispatcharr's own logger, the one handed to every action,
+        prints from both.
         """
-        logger = logging.getLogger(__name__)
+        logger = logger or logging.getLogger(__name__)
         settings = self._settings_with_defaults()
         settings = self._reconcile_registry(settings, logger)
         settings = self._migrate_legacy_globals(settings, logger)

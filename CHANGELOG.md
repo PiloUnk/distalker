@@ -31,6 +31,17 @@ credentials will say so.
   its own. The thread was right for the button, which answers a browser and
   cannot block; it was wrong here, where the worker hosting it is reaped when
   the pool scales down — taking the sync with it, silently.
+- **A scheduled sync now appears in the log.** It always ran; it just wrote
+  everything it did to a logger that prints from the process serving the
+  panel and not from the one running the schedule. Channel counts, guide
+  sizes and failures alike went nowhere, which made a refresh that worked
+  indistinguishable from one that never fired.
+- The portal whose own refresh woke the sync is asked a second time, a minute
+  later, to re-read its playlist. Its first request is refused: the sync runs
+  inside that account's refresh task, which holds the account's lock until we
+  are done. Left as it was, that one portal would be downloaded on every cycle
+  and read on the next — a day late on a daily schedule, and a different
+  portal each time, since they race to be the one that wakes us.
 
 **Guide**
 

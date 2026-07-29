@@ -132,7 +132,7 @@ def run_sync_in_background(full: bool = False) -> bool:
     return True
 
 
-def run_sync_here(full: bool = False):
+def run_sync_here(full: bool = False, logger=None):
     """The same sync, run in the caller rather than handed to a thread.
 
     For the scheduled path, and only that one. A thread is right when the
@@ -145,6 +145,10 @@ def run_sync_here(full: bool = False):
     A Celery task is where long work belongs anyway. The one hosting the event
     is ``refresh_single_m3u_account``, which allows an hour before its soft
     limit; a full sync of a dozen portals is minutes.
+
+    The caller's logger is passed on rather than left to the sync to invent,
+    because the one it invents does not print from a Celery worker -- see
+    Plugin.run_sync_now.
 
     Returns the sync's own result, or None when another sync already holds the
     lock -- the same two guards as the threaded version, for the same reasons.
@@ -172,7 +176,7 @@ def run_sync_here(full: bool = False):
 
         # No close_old_connections here, unlike the threaded version: this runs
         # on the caller's connection, and Celery closes its own after a task.
-        return Plugin().run_sync_now(full=full)
+        return Plugin().run_sync_now(full=full, logger=logger)
     finally:
         if claimed:
             release_sync_lock(token)

@@ -450,6 +450,44 @@ def request_reparse(account_id: int, refresh_hours: int) -> str:
     return "refresh_m3u_groups"
 
 
+# How long to wait before re-asking for the playlist of the account whose own
+# refresh woke us. It only has to outlast the tail of that task once the sync
+# has returned, which is a fraction of a second; a minute is margin, and being
+# late costs nothing on a run nobody is watching.
+TRIGGER_REPARSE_DELAY = 60
+
+
+def request_reparse_later(account_name: str, delay: int = TRIGGER_REPARSE_DELAY) -> bool:
+    """Re-ask for the playlist of the account whose refresh started this sync.
+
+    That one account cannot be re-read in line with the others. A scheduled
+    sync runs *inside* Dispatcharr's ``refresh_single_m3u_account`` for it, and
+    that task holds the per-account lock for as long as we do -- so the request
+    made at the end of its portal is refused, leaving 'Lock for
+    refresh_single_m3u_account and id=N already acquired' as the only trace.
+
+    Left alone, that portal's playlist is downloaded every cycle and read one
+    cycle late, for ever: an hour behind on an hourly schedule, a day behind on
+    a daily one. Which portal draws the short straw changes from cycle to
+    cycle, since the accounts race to be the one that wakes us.
+
+    So it is asked for again once we have returned and the lock has gone.
+    Refused a second time would be no worse than not asking, which is why a
+    delay is enough and no coordination is needed.
+    """
+    from apps.m3u.tasks import refresh_single_m3u_account
+
+    account = distalker_accounts().filter(name=account_name).first()
+    if account is None:
+        return False
+
+    # Same reason as request_reparse: the task about to run emits the event the
+    # schedule listens for.
+    hold_auto_sync(AUTO_SYNC_COOLDOWN)
+    refresh_single_m3u_account.apply_async((account.id,), countdown=max(1, int(delay)))
+    return True
+
+
 def refresh_epg_source(source_id: int) -> None:
     """Ask Dispatcharr to read the guide we just wrote.
 
