@@ -25,6 +25,7 @@ from .stalker_api import (
     PortalError,
     as_int,
     encode_pseudo_url,
+    hold_auto_sync,
     python_executable,
     save_fallback,
     save_portal,
@@ -38,6 +39,11 @@ M3U_DIR = "/data/uploads/m3us"
 # fills with files named after a source id -- ours are named after a portal and
 # are inputs to that machinery rather than products of it.
 XMLTV_DIR = "/data/uploads/epgs"
+
+# How long a sync mutes the scheduled path after asking for a re-read. Matches
+# plugin.AUTO_SYNC_COOLDOWN, and is defined here because this module may not
+# import from plugin.py -- the dependency runs the other way.
+AUTO_SYNC_COOLDOWN = 1800
 
 STREAM_PROFILE_NAME = "Distalker"
 ACCOUNT_PREFIX = "Distalker: "
@@ -432,6 +438,11 @@ def request_reparse(account_id: int, refresh_hours: int) -> str:
     from apps.m3u.tasks import refresh_m3u_groups, refresh_single_m3u_account
 
     if refresh_hours:
+        # Before dispatching, not after: the task about to run emits the event
+        # the schedule listens for, and a sync the user started by hand claims
+        # no cooldown of its own -- so without this its echo comes back as a
+        # full re-fetch of every portal.
+        hold_auto_sync(AUTO_SYNC_COOLDOWN)
         refresh_single_m3u_account.delay(account_id)
         return "refresh_single_m3u_account"
 

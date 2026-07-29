@@ -927,6 +927,29 @@ def claim_auto_sync(ttl: int = 1800, client=None) -> bool:
         return False
 
 
+def hold_auto_sync(ttl: int = 1800, client=None) -> None:
+    """Mute the scheduled path for a while, without asking permission.
+
+    Claimed by any sync that ends by asking Dispatcharr to re-read a playlist,
+    because that re-read emits the event the schedule listens for -- and a sync
+    the user started by hand would otherwise come back as an echo and set off a
+    full re-fetch of every portal. Observed: adding one portal, and the echo
+    arriving two seconds later.
+
+    A plain write rather than :func:`claim_auto_sync`'s NX, since the point is
+    to push the window forward whether or not one is already open. The cost is
+    that a manual sync delays the next scheduled one, which is the right
+    trade -- everything was just fetched.
+    """
+    client = _client_or_none(client)
+    if client is None:
+        return
+    try:
+        client.set(_auto_sync_key(), "1", ex=max(60, int(ttl)))
+    except Exception:
+        pass
+
+
 def release_sync_lock(token: str, client=None) -> None:
     """Release the lock, but only while it is still ours.
 

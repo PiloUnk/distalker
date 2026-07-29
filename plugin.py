@@ -589,6 +589,25 @@ class Plugin:
             if reason:
                 return {"status": "ok", "message": reason, "changed": False}
 
+            # Here, not in a thread. The event arrives inside a Celery task,
+            # where a daemon thread dies with the worker the moment the pool
+            # scales down -- see tasks.run_sync_here. Running it where we
+            # stand also means the report is the real one rather than a
+            # promise that something has started.
+            result = tasks.run_sync_here(full=True)
+            if result is None:
+                # Said out loud, because this is the one outcome that used to
+                # leave no trace at all: an event run that changes nothing is
+                # not recorded in the panel either, so a schedule refused by
+                # the lock looked exactly like a schedule that never fired.
+                logger.info(
+                    "distalker: the scheduled sync stood down -- another one "
+                    "holds the lock"
+                )
+                return {"status": "ok", "message": self._already_running(),
+                        "changed": False}
+            return {"status": "ok", "message": result["message"], "changed": True}
+
         portals = self._portals(settings)
 
         if not tasks.run_sync_in_background(full=True):
@@ -632,7 +651,7 @@ class Plugin:
             return "a scheduled sync ran too recently"
 
         logger.info(
-            "distalker: '%s' refreshed on schedule; re-fetching every portal", account
+            "distalker: answering the scheduled refresh of '%s'", account
         )
         return ""
 

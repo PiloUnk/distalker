@@ -132,6 +132,54 @@ def run_sync_in_background(full: bool = False) -> bool:
     return True
 
 
+def run_sync_here(full: bool = False):
+    """The same sync, run in the caller rather than handed to a thread.
+
+    For the scheduled path, and only that one. A thread is right when the
+    caller is a uWSGI request that has to answer now, and wrong when it is a
+    Celery task: there is no gevent hub there, the thread is a real daemon
+    thread, and the worker process it lives in is reaped when the pool scales
+    down. Observed exactly that -- the sync announced itself, produced nothing,
+    and forty seconds later the pool shrank by five.
+
+    A Celery task is where long work belongs anyway. The one hosting the event
+    is ``refresh_single_m3u_account``, which allows an hour before its soft
+    limit; a full sync of a dozen portals is minutes.
+
+    Returns the sync's own result, or None when another sync already holds the
+    lock -- the same two guards as the threaded version, for the same reasons.
+    """
+    from uuid import uuid4
+
+    from .stalker_api import claim_sync_lock, release_sync_lock
+
+    global _sync_running
+
+    with _SYNC_LOCK:
+        if _sync_running:
+            return None
+        _sync_running = True
+
+    token = uuid4().hex
+    claimed = claim_sync_lock(token)
+    if claimed is False:
+        with _SYNC_LOCK:
+            _sync_running = False
+        return None
+
+    try:
+        from .plugin import Plugin
+
+        # No close_old_connections here, unlike the threaded version: this runs
+        # on the caller's connection, and Celery closes its own after a task.
+        return Plugin().run_sync_now(full=full)
+    finally:
+        if claimed:
+            release_sync_lock(token)
+        with _SYNC_LOCK:
+            _sync_running = False
+
+
 def remove_schedule() -> None:
     """Drop the periodic task versions before 0.9.4 created.
 

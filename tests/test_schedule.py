@@ -68,20 +68,28 @@ class Recorder:
         self.started = started
 
     def resync(self, params, settings):
-        original = plugin_mod.tasks.run_sync_in_background
-        portals = plugin_mod.Plugin._portals
+        """Both routes stubbed: a click threads it, an event runs it here."""
+        originals = (plugin_mod.tasks.run_sync_in_background,
+                     plugin_mod.tasks.run_sync_here,
+                     plugin_mod.Plugin._portals)
 
-        def fake_sync(full=False):
-            self.calls.append(full)
+        def fake_thread(full=False):
+            self.calls.append(("threaded", full))
             return self.started
 
-        plugin_mod.tasks.run_sync_in_background = fake_sync
+        def fake_here(full=False):
+            self.calls.append(("here", full))
+            return {"message": "done"} if self.started else None
+
+        plugin_mod.tasks.run_sync_in_background = fake_thread
+        plugin_mod.tasks.run_sync_here = fake_here
         plugin_mod.Plugin._portals = lambda self, settings: []
         try:
             return self.plugin._action_resync_all(params, settings, _Logger())
         finally:
-            plugin_mod.tasks.run_sync_in_background = original
-            plugin_mod.Plugin._portals = portals
+            (plugin_mod.tasks.run_sync_in_background,
+             plugin_mod.tasks.run_sync_here,
+             plugin_mod.Plugin._portals) = originals
 
 
 class _Logger:
@@ -121,7 +129,7 @@ def test_a_button_press_always_syncs():
     try:
         rec = Recorder()
         result = rec.resync({}, {"refresh_hours": 0})
-        assert rec.calls == [True], rec.calls
+        assert rec.calls == [("threaded", True)], rec.calls
         assert result["changed"] is True
         # Untouched: the cooldown is for the schedule, not for the button.
         assert client.store == {}, client.store
@@ -166,7 +174,7 @@ def test_the_second_event_of_a_cycle_is_the_one_we_caused():
     try:
         first = Recorder()
         assert first.resync(event(), {"refresh_hours": 12})["changed"] is True
-        assert first.calls == [True]
+        assert first.calls == [("here", True)]
 
         second = Recorder()
         result = second.resync(event(), {"refresh_hours": 12})
@@ -182,7 +190,7 @@ def test_a_scheduled_run_refetches_everything():
     try:
         rec = Recorder()
         rec.resync(event(), {"refresh_hours": 6})
-        assert rec.calls == [True], "the schedule must force a full re-fetch"
+        assert rec.calls == [("here", True)], "the schedule must force a full re-fetch"
     finally:
         restore()
 
@@ -196,6 +204,87 @@ def test_a_sync_already_running_is_not_started_twice():
         assert "already running" in result["message"], result
     finally:
         restore()
+
+
+def test_a_scheduled_sync_is_not_handed_to_a_thread():
+    """The one that had to be learned from a log rather than from reading.
+
+    A click arrives on a uWSGI request that must answer now, so its sync goes
+    to a thread. An event arrives inside a Celery task, where that same thread
+    is a real daemon thread in a worker the pool reaps when it scales down --
+    the sync announced itself, produced nothing, and forty seconds later five
+    processes went away. Long work belongs in the Celery task, so that is
+    where it runs.
+    """
+    client, restore = fresh_redis()
+    try:
+        rec = Recorder()
+        rec.resync(event(), {"refresh_hours": 6})
+        assert rec.calls == [("here", True)], rec.calls
+        assert not any(kind == "threaded" for kind, _ in rec.calls), rec.calls
+    finally:
+        restore()
+
+
+def test_a_scheduled_sync_reports_what_it_actually_did():
+    """Running it here means the answer is a result, not a promise."""
+    client, restore = fresh_redis()
+    try:
+        rec = Recorder()
+        result = rec.resync(event(), {"refresh_hours": 6})
+        assert result["message"] == "done", result
+        assert "background" not in result["message"], result
+    finally:
+        restore()
+
+
+def test_a_manual_sync_mutes_its_own_echo():
+    """A sync the user started must not come back as a scheduled one.
+
+    Every synced portal asks Dispatcharr to re-read its playlist, and that
+    re-read emits the event the schedule listens for. The scheduled path holds
+    a cooldown while it works, so its own echo lands inside it -- but a sync
+    started by hand holds nothing, and its echo was answered with a full
+    re-fetch of every portal. Seen once, on a single portal being added, and
+    prevented only by the sync lock happening to still be held.
+    """
+    import importlib.util as _u
+    import types as _t
+
+    held = []
+
+    class Task:
+        def delay(self, account_id):
+            pass
+
+    fake_tasks = _t.ModuleType("apps.m3u.tasks")
+    fake_tasks.refresh_m3u_groups = Task()
+    fake_tasks.refresh_single_m3u_account = Task()
+    apps = _t.ModuleType("apps")
+    m3u = _t.ModuleType("apps.m3u")
+    saved = {k: sys.modules.get(k) for k in ("apps", "apps.m3u", "apps.m3u.tasks")}
+    sys.modules.update({"apps": apps, "apps.m3u": m3u, "apps.m3u.tasks": fake_tasks})
+
+    spec = _u.spec_from_file_location(
+        "distalker_sched.sync2", os.path.join(REPO, "sync.py")
+    )
+    sync = _u.module_from_spec(spec)
+    sys.modules["distalker_sched.sync2"] = sync
+    try:
+        spec.loader.exec_module(sync)
+        sync.hold_auto_sync = lambda ttl=0: held.append(ttl)
+
+        sync.request_reparse(7, 0)
+        assert held == [], "no schedule, nothing to mute"
+
+        sync.request_reparse(7, 6)
+        assert held == [sync.AUTO_SYNC_COOLDOWN], held
+    finally:
+        for key, module in saved.items():
+            if module is None:
+                sys.modules.pop(key, None)
+            else:
+                sys.modules[key] = module
 
 
 def test_the_schedule_is_applied_on_the_path_that_fetches_nothing():

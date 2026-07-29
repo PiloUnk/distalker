@@ -20,7 +20,17 @@ credentials will say so.
   of each refresh is what calls back to re-fetch the portal.
 - Refreshing an M3U account that is not one of ours does nothing, and a
   scheduled run cannot follow another within thirty minutes — the second is the
-  echo of the first, and answering it would loop.
+  echo of the first, and answering it would loop. In practice it does more than
+  that: twelve accounts sharing one interval all fire at the same second, and
+  eleven of those are turned away.
+- A sync started by hand no longer comes back as a scheduled one. Every synced
+  portal asks Dispatcharr to re-read its playlist, and that re-read emits the
+  event the schedule listens for — so adding a single portal could set off a
+  re-fetch of every other one.
+- A scheduled sync runs inside the task that woke it rather than in a thread of
+  its own. The thread was right for the button, which answers a browser and
+  cannot block; it was wrong here, where the worker hosting it is reaped when
+  the pool scales down — taking the sync with it, silently.
 
 **Guide**
 
