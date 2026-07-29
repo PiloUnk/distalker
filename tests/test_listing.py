@@ -33,8 +33,8 @@ def row(**overrides):
 
 
 def test_a_bare_filename_is_resolved_against_the_portal():
-    assert portal().logo_url("canal.png") == (
-        "http://p.example/c/misc/logos/320/canal.png"
+    assert portal().logo_url("alpha.png") == (
+        "http://p.example/c/misc/logos/320/alpha.png"
     )
 
 

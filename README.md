@@ -173,6 +173,8 @@ further `|` characters, quoted where a value contains spaces
 | `username` | Portal login, if your provider issued one | — |
 | `password` | Portal password | — |
 | `max_streams` | Concurrent connections allowed for this MAC | `1` |
+| `epg` | `epg=1` fetches this portal's programme guide — see below | off |
+| `epg_hours` | How much guide to ask for, in hours | `24` |
 | *STB keys* | `model`, `serial`, `device_id`, `device_id2`, `signature`, `timezone` — see below | MAG254 |
 
 > **`max_streams` cannot be detected.** Portals do not tell the box what the
@@ -323,11 +325,45 @@ dates natively. If the portal reports the account as blocked, the line says so
 in capitals: a blocked account otherwise looks exactly like an empty channel
 list.
 
+### Programme guide
+
+Add `epg=1` to a portal line and the next sync also fetches its guide, writes
+an XMLTV file, and registers it under **EPGs** as `Distalker: <portal>` — the
+same arrangement as the M3U account it creates for the channels. Dispatcharr
+then matches programmes to channels on the `tvg-id` the playlist already
+carries, so nothing needs mapping by hand.
+
+```
+Living room | http://portal.example/c/ | 00:1A:79:AA:BB:CC | epg=1
+Living room | http://portal.example/c/ | 00:1A:79:AA:BB:CC | epg=1 epg_hours=48
+```
+
+**It is off by default because it is expensive.** A portal answers `get_epg_info`
+for its *entire* line-up in one response: on a 13,000-channel portal, a single
+day is on the order of 100 MB, and the period multiplies that directly. Start at
+the default 24 hours and raise it only if your portal copes. Beyond 200 MB the
+download is abandoned with a message telling you to lower `epg_hours`.
+
+**Not every portal has one.** A provider can carry thousands of channels and no
+programmes for any of them; it answers with an empty guide and the log says so,
+suggesting you drop `epg=1` from that line. Some serve a guide one channel at a
+time instead of as a whole grid — Distalker does not use that, because it costs
+one request per channel and, where it was measured, covered almost none of the
+channels anyone had actually configured.
+
+A guide that fails — too large, refused, in a shape this does not recognise — is
+logged and skipped. It never fails the sync around it, so you keep the channel
+list either way.
+
+Channels the portal has no programmes for are left out of the file rather than
+written empty, and turning `epg=1` off again deactivates the EPG source without
+deleting it.
+
 ## Limitations
 
 - **Live TV only.** No VOD, no series.
-- **No EPG yet.** Generated `tvg-id`s are stable (`<slug>.<channel-id>`), so EPG
-  can be added later without disturbing existing streams.
+- **The guide is fetched, never scheduled on its own.** It refreshes when you
+  press Sync, like everything else this plugin does.
 - **Credentials are stored unencrypted**, in the Dispatcharr database and on
   disk — see [What it writes, and where](#what-it-writes-and-where).
 - **No session keep-alive.** A cached token is reused and re-issued on demand.

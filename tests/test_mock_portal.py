@@ -52,9 +52,9 @@ class PortalHandler(BaseHTTPRequestHandler):
             ]})
         if action == "get_all_channels":
             return self._reply({"js": {"data": [
-                {"id": "101", "name": 'Canal+ "HD"', "cmd": "ffmpeg http://prov/ch/101",
-                 "logo": "canal.png", "tv_genre_id": "1", "number": "1"},
-                {"id": "102", "name": "BBC One", "cmd": "ffmpeg http://prov/ch/102",
+                {"id": "101", "name": 'Alpha "HD"', "cmd": "ffmpeg http://prov/ch/101",
+                 "logo": "alpha.png", "tv_genre_id": "1", "number": "1"},
+                {"id": "102", "name": "Beta One", "cmd": "ffmpeg http://prov/ch/102",
                  "logo": "", "tv_genre_id": "2", "number": "2"},
                 {"id": "103", "name": "No Genre", "cmd": "ffmpeg http://prov/ch/103",
                  "logo": "ng.png", "tv_genre_id": "99", "number": ""},
@@ -63,6 +63,16 @@ class PortalHandler(BaseHTTPRequestHandler):
             cmd = params.get("cmd", [""])[0]
             assert cmd.startswith("ffmpeg "), f"cmd not decoded properly: {cmd!r}"
             return self._reply({"js": {"cmd": "ffmpeg http://prov/live/101.m3u8?token=FRESH"}})
+        if action == "get_epg_info":
+            assert params.get("period") == ["24"], params
+            return self._reply({"js": {"data": {
+                "101": [{"id": "1", "name": "Evening Report", "descr": "News & more",
+                         "start_timestamp": 1785276000, "stop_timestamp": 1785279600}],
+                # A channel the playlist does not carry: the guide must not
+                # invent an entry for it.
+                "999": [{"id": "2", "name": "Ghost", "descr": "",
+                         "start_timestamp": 1785276000, "stop_timestamp": 1785279600}],
+            }}})
         if action == "get_events":
             return self._reply({"js": [], "text": ""})
         return self._reply({"js": []})
@@ -126,7 +136,7 @@ def main():
     print("\n--- generated M3U ---")
     print(m3u)
 
-    # The quote in 'Canal+ "HD"' must not break the attribute quoting.
+    # The quote in 'Alpha "HD"' must not break the attribute quoting.
     assert '"' not in m3u.split("\n")[1].split(",")[0].replace('tvg-id="', "").replace('"', "") or True
     for line in m3u.splitlines():
         if line.startswith("#EXTINF"):
@@ -134,7 +144,7 @@ def main():
     assert 'group-title="FR| SPORT"' in m3u
     assert 'group-title="Other"' in m3u, "unknown genre must fall back to Other"
     assert 'tvg-id="mock.101"' in m3u
-    assert "misc/logos/320/canal.png" in m3u
+    assert "misc/logos/320/alpha.png" in m3u
 
     # Round-trip a generated URL exactly as resolver.py would.
     pseudo = [l for l in m3u.splitlines() if l.startswith("http://distalker.invalid")][0]
@@ -174,6 +184,28 @@ def main():
     assert profiles[0]["hw_version"] == [s.STB_HW_VERSION], profiles[0]
     assert "PORTAL version: 4.9.9" in profiles[0]["ver"][0], profiles[0]
     print("get_profile state machine (status 2 -> do_auth -> second step): OK")
+
+    # The guide, over a real socket: the streamed download and the scratch
+    # file are the parts a faked transport would never exercise.
+    epg_data = portal.get_epg_info(24)
+    assert set(epg_data) == {"101", "999"}, epg_data
+    guide = "".join(sync.build_xmltv(portal, channels, epg_data))
+    print("\n--- generated XMLTV ---")
+    print(guide)
+
+    import xml.etree.ElementTree as ET
+
+    root = ET.fromstring(guide)
+    ids = [c.get("id") for c in root.findall("channel")]
+    assert ids == ["mock.101"], ids
+    assert root.find("programme").get("channel") == "mock.101"
+    assert root.find("programme/title").text == "Evening Report"
+    assert root.find("programme/desc").text == "News & more"
+    assert root.find("programme").get("start") == "20260728220000 +0000"
+    # Every tvg-id in the guide must exist in the playlist it accompanies.
+    for cid in ids:
+        assert f'tvg-id="{cid}"' in m3u, cid
+    print("XMLTV round-trip and tvg-id agreement: OK")
 
     # ffmpeg argv construction, as resolver.py builds it.
     import resolver

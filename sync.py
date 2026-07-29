@@ -12,14 +12,18 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import tempfile
-from typing import Any, Dict, List, Optional
+from datetime import datetime, timezone
+from typing import Any, Dict, Iterator, List, Optional
+from xml.sax.saxutils import escape, quoteattr
 
 from .stalker_api import (
     ChannelEntry,
     Portal,
     PortalConfig,
     PortalError,
+    as_int,
     encode_pseudo_url,
     python_executable,
     save_fallback,
@@ -29,6 +33,11 @@ from .stalker_api import (
 # Where Dispatcharr's own M3U upload endpoint puts files. Reusing it keeps our
 # generated playlists alongside user-uploaded ones and inside the data volume.
 M3U_DIR = "/data/uploads/m3us"
+
+# The same idea for guides. Kept out of Dispatcharr's own 'cached_epg', which it
+# fills with files named after a source id -- ours are named after a portal and
+# are inputs to that machinery rather than products of it.
+XMLTV_DIR = "/data/uploads/epgs"
 
 STREAM_PROFILE_NAME = "Distalker"
 ACCOUNT_PREFIX = "Distalker: "
@@ -115,6 +124,162 @@ def write_m3u(slug: str, content: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# XMLTV generation
+# ---------------------------------------------------------------------------
+#
+# Dispatcharr reads a guide with lxml's iterparse and takes five things from it
+# (apps/epg/tasks.py): a channel's id, its first display-name and its icon;
+# then each programme's channel, start, stop, title, desc and sub-title.
+# Everything else in the XMLTV vocabulary is ignored, so none of it is written.
+
+# Characters XML 1.0 has no way to carry. Portals do send them -- a stray 0x03
+# inside a programme description is enough to make lxml's recovery drop the
+# element around it, so they are removed rather than escaped.
+_ILLEGAL_XML = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
+
+
+def _xml_text(value: Any) -> str:
+    """A string safe to place between XML tags."""
+    return escape(_ILLEGAL_XML.sub("", str(value or "")))
+
+
+def _xmltv_time(value: Any) -> str:
+    """A Unix timestamp as XMLTV writes it, or '' if it is not one.
+
+    ``YYYYMMDDHHMMSS +0000``: exactly the 20 characters Dispatcharr's
+    ``parse_xmltv_time`` expects, and always UTC, because a portal's epoch is
+    an instant and the local time it corresponds to is nobody's business here.
+    """
+    seconds = as_int(value, -1)
+    if seconds <= 0:
+        return ""
+    try:
+        moment = datetime.fromtimestamp(seconds, timezone.utc)
+    except (OverflowError, OSError, ValueError):
+        return ""
+    return moment.strftime("%Y%m%d%H%M%S +0000")
+
+
+def build_xmltv(
+    portal: Portal,
+    channels: List[ChannelEntry],
+    epg_data: Dict[str, Any],
+) -> Iterator[str]:
+    """Yield an XMLTV document for the channels the portal has a guide for.
+
+    A generator, and ``epg_data`` is emptied as it goes: the guide for a large
+    portal is the biggest structure this plugin ever holds, and building the
+    document as one string would mean holding it twice. The caller writes each
+    piece out and nothing accumulates.
+
+    Only channels with at least one programme get an entry. A ``<channel>``
+    with nothing under it still becomes a row in Dispatcharr's EPG table, and
+    13,000 rows that will never match a programme are not a guide, they are
+    thirteen thousand empty promises in the channel-to-EPG picker.
+    """
+    slug = portal.cfg.slug
+
+    def tvg_id(channel: ChannelEntry) -> str:
+        # The identifier already written into the playlist. The two must agree
+        # exactly or nothing binds -- see test_the_playlist_and_the_guide_agree.
+        return f"{slug}.{channel.channel_id}" if channel.channel_id else ""
+
+    listed = [
+        channel for channel in channels
+        if tvg_id(channel) and epg_data.get(channel.channel_id)
+    ]
+
+    yield '<?xml version="1.0" encoding="UTF-8"?>\n'
+    yield '<tv generator-info-name="Distalker">\n'
+
+    for channel in listed:
+        yield f"  <channel id={quoteattr(tvg_id(channel))}>\n"
+        yield f"    <display-name>{_xml_text(channel.name)}</display-name>\n"
+        logo = portal.logo_url(channel.logo)
+        if logo:
+            yield f"    <icon src={quoteattr(logo)} />\n"
+        yield "  </channel>\n"
+
+    for channel in listed:
+        # pop, not get: this is where the memory goes back.
+        programmes = epg_data.pop(channel.channel_id, None) or []
+        channel_id = quoteattr(tvg_id(channel))
+        for start, stop, title, description in _timeline(programmes):
+            yield (
+                f"  <programme start={quoteattr(start)} stop={quoteattr(stop)} "
+                f"channel={channel_id}>\n"
+            )
+            yield f"    <title>{title}</title>\n"
+            if description:
+                yield f"    <desc>{description}</desc>\n"
+            yield "  </programme>\n"
+
+    yield "</tv>\n"
+
+
+def _timeline(programmes: Any) -> Iterator[tuple]:
+    """One channel's programmes, in order and without overlaps.
+
+    Portals do send overlapping entries -- the same show listed twice with two
+    start times and one end, which is what a guide that has been corrected in
+    place looks like from outside. XMLTV permits it and readers do not expect
+    it: Dispatcharr picks a programme for an instant by searching the ones that
+    span it (``_match_epg_program_by_timeslot``), so two candidates for the same
+    minute is an arbitrary answer to "what is on now".
+
+    Earliest start wins, since it is the one covering the whole slot. Anything
+    beginning before the kept programme ends is dropped; touching exactly, which
+    is what back-to-back programmes do, is not an overlap and is kept.
+    """
+    usable = []
+    for programme in programmes if isinstance(programmes, list) else []:
+        if not isinstance(programme, dict):
+            continue
+        start = _xmltv_time(programme.get("start_timestamp"))
+        stop = _xmltv_time(programme.get("stop_timestamp"))
+        # A programme without both ends is not a programme. Dispatcharr would
+        # store it with a nonsense duration rather than reject it -- and the
+        # portal's own 'duration' field is no help: it arrives negative on
+        # programmes that plainly last two hours.
+        if not start or not stop or stop <= start:
+            continue
+        title = _xml_text(programme.get("name"))
+        if not title:
+            continue
+        usable.append((start, stop, title, _xml_text(programme.get("descr"))))
+
+    # The timestamps sort correctly as strings: fixed width, most significant
+    # first, and all of them UTC.
+    usable.sort(key=lambda item: (item[0], item[1]))
+
+    last_stop = ""
+    for entry in usable:
+        if entry[0] < last_stop:
+            continue
+        last_stop = entry[1]
+        yield entry
+
+
+def write_xmltv(slug: str, chunks: Iterator[str]) -> str:
+    """Stream a guide to disk atomically, as :func:`write_m3u` does for a playlist."""
+    os.makedirs(XMLTV_DIR, exist_ok=True)
+    path = os.path.join(XMLTV_DIR, f"distalker-{slug}.xml")
+
+    fd, temp_path = tempfile.mkstemp(dir=XMLTV_DIR, prefix=f".distalker-{slug}-")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            for chunk in chunks:
+                handle.write(chunk)
+        os.replace(temp_path, path)
+    except Exception:
+        if os.path.exists(temp_path):
+            os.unlink(temp_path)
+        raise
+
+    return path
+
+
+# ---------------------------------------------------------------------------
 # Dispatcharr model wiring
 # ---------------------------------------------------------------------------
 
@@ -170,6 +335,84 @@ def upsert_account(cfg: PortalConfig, file_path: str):
     if created:
         announce_new_account(account.id)
     return account, created
+
+
+def distalker_epg_sources():
+    """Every EPG source this plugin owns, found by marker rather than by name."""
+    from apps.epg.models import EPGSource
+
+    return EPGSource.objects.filter(custom_properties__has_key=MARKER_KEY)
+
+
+def upsert_epg_source(cfg: PortalConfig, file_path: str):
+    """Create or update the EPG source backing one portal.
+
+    The mirror image of :func:`upsert_account`, and for the same reason: a
+    source with a ``file_path`` and no ``url`` is a first-class case in
+    Dispatcharr (``apps/epg/tasks.py`` takes the local-file branch when
+    ``not source.url``), so the guide costs no HTTP endpoint either.
+    """
+    from apps.epg.models import EPGSource
+
+    source = distalker_epg_sources().filter(
+        **{f"custom_properties__{MARKER_KEY}__slug": cfg.slug}
+    ).first()
+
+    created = False
+    if source is None:
+        source, created = EPGSource.objects.get_or_create(
+            name=ACCOUNT_PREFIX + cfg.name,
+            defaults={"source_type": "xmltv"},
+        )
+
+    source.name = ACCOUNT_PREFIX + cfg.name
+    source.source_type = "xmltv"
+    source.file_path = file_path
+    # Blank, and that is what selects the local-file branch. A source with both
+    # would be downloaded from the URL and our file ignored.
+    source.url = None
+    source.is_active = True
+    # We rewrite the file ourselves before asking for a re-parse, so a schedule
+    # of Dispatcharr's own would only re-read a file that had not changed.
+    source.refresh_interval = 0
+
+    properties = dict(source.custom_properties or {})
+    properties[MARKER_KEY] = {"slug": cfg.slug, "portal": cfg.url}
+    source.custom_properties = properties
+
+    source.save()
+    return source, created
+
+
+def deactivate_epg_source(cfg: PortalConfig) -> bool:
+    """Switch off the guide for a portal that no longer asks for one.
+
+    Not deleted: the plugin does not remove things a user can see and may have
+    configured around -- the same restraint that leaves an M3U account standing
+    when its portal line goes away. Deactivating is enough to stop a guide that
+    is no longer refreshed from binding itself to channels.
+    """
+    source = distalker_epg_sources().filter(
+        **{f"custom_properties__{MARKER_KEY}__slug": cfg.slug}
+    ).first()
+    if source is None or not source.is_active:
+        return False
+
+    source.is_active = False
+    source.save(update_fields=["is_active"])
+    return True
+
+
+def refresh_epg_source(source_id: int) -> None:
+    """Ask Dispatcharr to read the guide we just wrote.
+
+    Its own task, dispatched by name from a registered module rather than
+    defined here -- a task a plugin defines cannot be consumed at all, which is
+    the whole story recorded in tasks.py.
+    """
+    from apps.epg.tasks import refresh_epg_data
+
+    refresh_epg_data.delay(source_id)
 
 
 def announce_new_account(account_id: int) -> None:
@@ -463,6 +706,8 @@ def sync_portal(cfg: PortalConfig, logger, trigger_refresh: bool = True) -> Dict
         path,
     )
 
+    epg = sync_epg(cfg, portal, channels, logger, trigger_refresh=trigger_refresh)
+
     return {
         "portal": cfg.name,
         "slug": cfg.slug,
@@ -473,7 +718,104 @@ def sync_portal(cfg: PortalConfig, logger, trigger_refresh: bool = True) -> Dict
         "file": path,
         "expires": snapshot["expires"],
         "blocked": snapshot["blocked"],
+        "epg": epg,
     }
+
+
+def sync_epg(
+    cfg: PortalConfig,
+    portal: Portal,
+    channels: List[ChannelEntry],
+    logger,
+    trigger_refresh: bool = True,
+) -> Optional[Dict[str, Any]]:
+    """Fetch the guide and hand it to Dispatcharr. Returns None when off.
+
+    Runs last, and cannot fail the sync around it. That is the whole design of
+    this function: the guide is an extra, it is by a wide margin the largest
+    thing fetched here, and a portal has many more ways to disappoint over
+    100 MB than over a channel list. A sync that ends with a working line-up
+    and no guide is a good outcome; one that loses the line-up because the
+    guide was too big is not.
+    """
+    if not cfg.epg:
+        # Inside its own guard for the same reason as everything else here: a
+        # portal that never wanted a guide must not fail its sync over one.
+        try:
+            if deactivate_epg_source(cfg):
+                logger.info(
+                    "distalker: '%s' no longer asks for a guide; its EPG source "
+                    "is switched off (not deleted)",
+                    cfg.name,
+                )
+        except Exception:
+            logger.debug("distalker: could not check for a stale guide", exc_info=True)
+        return None
+
+    try:
+        logger.info(
+            "distalker: %s: fetching %d hours of guide for %d channels",
+            cfg.name,
+            cfg.epg_hours,
+            len(channels),
+        )
+        epg_data = portal.get_epg_info(cfg.epg_hours, scratch_dir=_scratch_dir())
+        if not epg_data:
+            # Said plainly, because it is a property of the provider rather
+            # than a fault to chase: a portal can carry thousands of channels
+            # and no programmes for any of them. Leaving 'epg=1' on costs one
+            # wasted request per sync and nothing else.
+            logger.warning(
+                "distalker: portal '%s' has no programme guide -- it answered "
+                "with an empty one. Remove 'epg=1' from its line to stop "
+                "asking.",
+                cfg.name,
+            )
+            return None
+
+        # build_xmltv empties epg_data as it writes, so nothing is counted
+        # afterwards -- count now, while it is still there to count.
+        covered = sum(1 for c in channels if epg_data.get(c.channel_id))
+
+        epg_path = write_xmltv(cfg.slug, build_xmltv(portal, channels, epg_data))
+        source, source_created = upsert_epg_source(cfg, epg_path)
+
+        if trigger_refresh:
+            refresh_epg_source(source.id)
+
+        logger.info(
+            "distalker: guide for '%s' -- %d channels covered -> %s",
+            cfg.name,
+            covered,
+            epg_path,
+        )
+        return {
+            "channels": covered,
+            "hours": cfg.epg_hours,
+            "file": epg_path,
+            "source_id": source.id,
+            "source_created": source_created,
+        }
+    except Exception as exc:
+        logger.warning(
+            "distalker: could not build the guide for '%s': %s", cfg.name, exc
+        )
+        logger.debug("distalker: guide failure detail", exc_info=True)
+        return None
+
+
+def _scratch_dir() -> Optional[str]:
+    """Where to stream a guide while it downloads.
+
+    Beside the finished file rather than in the system temp: the guide can be
+    hundreds of megabytes, and a container's /tmp is often a small tmpfs -- in
+    memory, which is precisely what streaming to a file is meant to avoid.
+    """
+    try:
+        os.makedirs(XMLTV_DIR, exist_ok=True)
+        return XMLTV_DIR
+    except OSError:
+        return None
 
 
 def sync_all(portals: List[PortalConfig], logger, trigger_refresh: bool = True) -> Dict[str, Any]:

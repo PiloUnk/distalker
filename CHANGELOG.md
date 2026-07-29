@@ -8,6 +8,26 @@ against what was last published, and none of them changed — only the code did.
 Test first, since it writes nothing and is where a portal that now needs
 credentials will say so.
 
+**Guide**
+
+- **Distalker can now fetch a portal's programme guide.** Add `epg=1` to a
+  portal line and the next sync writes an XMLTV file and registers it under
+  **EPGs** as `Distalker: <portal>` — the same arrangement as the M3U account
+  it already creates for the channels. Matching is automatic: the `tvg-id` the
+  playlist has always carried is what Dispatcharr joins on.
+- Off unless asked for, because it is by a wide margin the largest thing a sync
+  downloads — a portal answers for its whole line-up at once, so a
+  13,000-channel provider means roughly 100 MB for a single day. `epg_hours=48`
+  raises the default 24; a guide past 200 MB is abandoned with a message saying
+  to lower it.
+- A guide that fails never fails the sync around it. You keep the channel list.
+- Channels the portal has no programmes for are left out rather than written as
+  empty entries, and removing `epg=1` deactivates the EPG source instead of
+  deleting it.
+- A portal with no guide says so plainly and suggests removing `epg=1`, rather
+  than reporting the same message as a portal that answered with something
+  unrecognisable — which is now reported as exactly that, and asks to be.
+
 **Connecting**
 
 - **The portal now decides which authentication it gets.** Distalker reads the

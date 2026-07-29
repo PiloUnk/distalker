@@ -33,6 +33,7 @@ from .registry import (
     save_registry,
 )
 from .stalker_api import (
+    DEFAULT_EPG_HOURS,
     DEFAULT_FFMPEG_ARGS,
     DEFAULT_TIMEOUT,
     STB_KEYS,
@@ -206,6 +207,13 @@ class Plugin:
                         extras.get("password", ""),
                         int(extras.get("max_streams", 1) or 1),
                         stb,
+                        # Carried through explicitly. This rewrite keeps only
+                        # what it is handed, so anything left out here is
+                        # silently deleted from the user's line.
+                        extras.get("epg", "").strip().lower()
+                        in ("1", "true", "yes", "on"),
+                        int(extras.get("epg_hours", DEFAULT_EPG_HOURS)
+                            or DEFAULT_EPG_HOURS),
                     )
                 )
                 changed += 1
@@ -487,6 +495,13 @@ class Plugin:
         "serial_number", "model", "timezone", "signature",
     )
 
+    # Everything a change to which means the portal has to be asked again.
+    # The line-up keys, plus the guide: turning 'epg=1' on changes nothing
+    # about the channels, so without this the plan would call the portal
+    # unchanged, fetch nothing, and leave the user pressing Sync at a setting
+    # that appears to do nothing.
+    FETCH_KEYS = LINEUP_KEYS + ("epg", "epg_hours")
+
     def _plan(self, portals: List[PortalConfig]) -> Dict[str, Any]:
         """Sort the configured portals into what needs the network and what does not.
 
@@ -505,7 +520,7 @@ class Plugin:
             previous = load_portal(cfg.slug) if cfg.slug in published else None
             if previous is None:
                 plan["new"].append(cfg)
-            elif any(getattr(cfg, key) != getattr(previous, key) for key in self.LINEUP_KEYS):
+            elif any(getattr(cfg, key) != getattr(previous, key) for key in self.FETCH_KEYS):
                 plan["changed"].append(cfg)
             else:
                 plan["unchanged"].append(cfg)
@@ -725,6 +740,11 @@ class Plugin:
                 entry += f", expires {state['expires']:%d %b %Y}"
             if just and just.get("blocked"):
                 entry += " -- THE PORTAL REPORTS THIS ACCOUNT AS BLOCKED"
+            # Dispatcharr's own guide toast names the source by its numeric id
+            # and nothing else (apps/epg/utils.py, send_epg_update), so this is
+            # the only place the portal's name and its guide appear together.
+            if just and just.get("epg"):
+                entry += f", guide for {just['epg']['channels']} of them"
             if just:
                 entry += " (just fetched)"
             lines.append(entry)

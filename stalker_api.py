@@ -82,6 +82,20 @@ AUTH_FAILED_BODY = "authorization failed."
 # enough bill for covering the transient half.
 RETRYABLE_STATUS = frozenset({429, 500, 502, 503, 504})
 
+# Hours of guide asked for when a portal line says 'epg=1' without saying how
+# much. pvr.stalker holds itself to the same figure, and its own comment says
+# why: get_epg_info answers for the *entire* line-up in one response, so the
+# period is a direct multiplier on a download that is already the largest thing
+# this plugin ever makes.
+DEFAULT_EPG_HOURS = 24
+
+# Refuse a guide bigger than this rather than discover the limit by having the
+# worker killed. A 13,000-channel portal answers with something like 100 MB for
+# a day, and the parsed form of that costs several times more again -- so this
+# is not a generous allowance, it is the point past which the sensible thing is
+# to say so and keep the channel list, which matters more than the guide.
+EPG_MAX_BYTES = 200 * 1024 * 1024
+
 # Last-resort bound on the paginated channel listing, for a portal that keeps
 # answering with something new and never says how much there is. Deliberately
 # far above any real line-up: whenever the portal reports 'total_items' the
@@ -240,6 +254,11 @@ class PortalConfig:
     timezone: str = DEFAULT_TIMEZONE
     signature: str = DEFAULT_SIGNATURE
     max_streams: int = 1
+    # Off unless the line says otherwise. One guide is a bigger download than
+    # everything else this plugin fetches put together, so it is asked for
+    # rather than assumed -- see DEFAULT_EPG_HOURS.
+    epg: bool = False
+    epg_hours: int = DEFAULT_EPG_HOURS
     ffmpeg_args: str = DEFAULT_FFMPEG_ARGS
     # Travels to Redis with the rest, so the resolver waits as long as the sync
     # does rather than giving up on a portal the sync copes with.
@@ -486,6 +505,19 @@ def parse_portals(text: str) -> Tuple[List[PortalConfig], List[str]]:
             errors.append(f"line {lineno}: max_streams must be a number")
             continue
 
+        # 'epg=1', 'epg=true', 'epg=yes' all mean the same thing to someone
+        # typing it from memory, so all of them are accepted; anything else
+        # -- including 'epg=0' -- leaves it off.
+        epg = extras.get("epg", "").strip().lower() in ("1", "true", "yes", "on")
+        try:
+            epg_hours = int(extras.get("epg_hours", DEFAULT_EPG_HOURS))
+        except ValueError:
+            errors.append(f"line {lineno}: epg_hours must be a number of hours")
+            continue
+        if epg_hours < 1:
+            errors.append(f"line {lineno}: epg_hours must be at least 1")
+            continue
+
         def resolve(key: str, fallback: str) -> Tuple[str, bool]:
             """This portal's value, else the built-in default.
 
@@ -521,6 +553,8 @@ def parse_portals(text: str) -> Tuple[List[PortalConfig], List[str]]:
             timezone=timezone,
             signature=signature,
             max_streams=max_streams,
+            epg=epg,
+            epg_hours=epg_hours,
         )
         portals.append(cfg)
 
@@ -542,6 +576,8 @@ def format_portal_line(
     password: str = "",
     max_streams: int = 1,
     stb: Optional[Dict[str, str]] = None,
+    epg: bool = False,
+    epg_hours: int = DEFAULT_EPG_HOURS,
 ) -> str:
     """Render one canonical line for the Portals setting.
 
@@ -565,6 +601,12 @@ def format_portal_line(
     # seeing on lines they never wrote themselves.
     if int(max_streams) != 1:
         extras.append(f"max_streams={int(max_streams)}")
+    if epg:
+        extras.append("epg=1")
+        # Same rule as max_streams: only written when it says something the
+        # default does not already say.
+        if int(epg_hours) != DEFAULT_EPG_HOURS:
+            extras.append(f"epg_hours={int(epg_hours)}")
 
     for key in STB_KEYS:
         value = (stb or {}).get(key, "").strip()
@@ -1619,6 +1661,86 @@ class Portal:
         if total > 0 and per_page > 0:
             return (total + per_page - 1) // per_page
         return 0
+
+    def get_epg_info(self, hours: int, scratch_dir: Optional[str] = None) -> Dict[str, Any]:
+        """The whole line-up's guide, keyed by the portal's channel id.
+
+        Deliberately not routed through :meth:`_get_json`, which is built for
+        replies that fit in a breath. This one does not: a portal with 13,000
+        channels answers a single day with something in the order of 100 MB,
+        and ``_get_json`` would hold the encoded bytes and the decoded object
+        at the same time.
+
+        So the reply is streamed to a scratch file first. That does not make
+        the parse cheaper -- the decoded structure is what it is -- but it does
+        two things worth the detour: nothing is decoded until the size is known,
+        so an absurd answer is refused instead of discovered by having the
+        worker killed; and requests never has to buffer the whole body.
+
+        Returns ``{channel_id: [programme, ...]}``, empty when the portal has
+        no guide to give. Never returns None, so a caller can iterate it.
+        """
+        query = (
+            "type=itv&action=get_epg_info&JsHttpRequest=1-xml"
+            f"&period={int(hours)}"
+        )
+        url = f"{self.url}?{query}&{self._common_params()}"
+        resp = self._request("GET", url, headers=self._headers(), stream=True)
+
+        if resp.status_code in (401, 403):
+            raise PortalAuthError(
+                f"portal refused the guide (HTTP {resp.status_code})"
+            )
+        if resp.status_code < 200 or resp.status_code >= 300:
+            raise PortalError(f"portal returned HTTP {resp.status_code} for the guide")
+
+        with tempfile.TemporaryFile(dir=scratch_dir) as scratch:
+            size = 0
+            for chunk in resp.iter_content(chunk_size=1024 * 256):
+                if not chunk:
+                    continue
+                size += len(chunk)
+                if size > EPG_MAX_BYTES:
+                    resp.close()
+                    raise PortalError(
+                        f"the guide is larger than {EPG_MAX_BYTES // (1024 * 1024)} MB "
+                        f"and was abandoned; ask for fewer hours than {int(hours)} "
+                        "with 'epg_hours=' on the portal line"
+                    )
+                scratch.write(chunk)
+
+            scratch.seek(0)
+            try:
+                data = json.load(scratch)
+            except ValueError:
+                raise PortalError("the guide was not JSON")
+
+        js = data.get("js") if isinstance(data, dict) else None
+        if not isinstance(js, dict):
+            raise PortalError(
+                f"the guide came back as {type(js).__name__} rather than an object"
+            )
+
+        rows = js.get("data")
+        if isinstance(rows, dict):
+            return rows
+
+        # An empty list is how a portal says it has no full guide -- observed on
+        # several, always as `{"js": {"data": []}}`. Not an error: plenty of
+        # portals carry a channel list and no programmes for it, or serve a
+        # guide one channel at a time, which is a different action and not one
+        # this uses.
+        if rows is None or (isinstance(rows, list) and not rows):
+            return {}
+
+        # Anything else is a shape nobody has met yet, and silently treating it
+        # as "no guide" is how it would stay unmet. A flat list of programmes,
+        # say, would be perfectly usable if someone knew it was arriving.
+        raise PortalError(
+            f"the guide arrived as {type(rows).__name__} with "
+            f"{len(rows) if hasattr(rows, '__len__') else '?'} entries, which "
+            "is not a shape this understands -- please report it"
+        )
 
     def create_link(self, cmd: str) -> str:
         """Ask the portal for a playable URL for ``cmd``.

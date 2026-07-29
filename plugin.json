@@ -19,7 +19,7 @@
       "type": "text",
       "default": "",
       "placeholder": "http://portal.example.com:8080/c/ | 00:1A:79:AA:BB:CC",
-      "help_text": "Portal URL | MAC address, one line each. The name is taken from the host, so put one in front only if you want a different label -- or if two portals share a host, which the sync will then ask you to do. Trailing key=value pairs cover the rest: username, password, max_streams, model, serial, device_id, device_id2, timezone. A line starting with '#' is ignored, which is how you suspend a portal without losing its channels. Credentials are stored unencrypted and are visible in this box."
+      "help_text": "Portal URL | MAC address, one line each. The name is taken from the host, so put one in front only if you want a different label -- or if two portals share a host, which the sync will then ask you to do. Trailing key=value pairs cover the rest: username, password, max_streams, model, serial, device_id, device_id2, timezone, and epg=1 to fetch this portal's programme guide (epg_hours=48 for more than a day -- a guide is by far the largest thing a sync downloads, which is why it is off unless asked for). A line starting with '#' is ignored, which is how you suspend a portal without losing its channels. Credentials are stored unencrypted and are visible in this box."
     },
     {
       "id": "status",
