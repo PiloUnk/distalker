@@ -126,6 +126,80 @@ def test_the_playlist_does_not_advertise_catch_up():
     assert "catchup" not in m3u.lower(), m3u
 
 
+# -- commands the portal cannot read back ---------------------------------
+
+
+def test_a_marker_is_left_exactly_as_it_came():
+    """Every portal but one answers this way, and their identities must not move.
+
+    The stream hash is partly the URL, ours encodes this command: rewriting a
+    command that was already fine would invent a new stream for every channel
+    on every portal, once.
+    """
+    for cmd in (
+        "ffmpeg http://localhost/ch/553690_",
+        "http://localhost/ch/553690_",
+        "ffmpeg http://prov/ch/101",
+        "ffrt3 http://localhost/ch/42_",
+    ):
+        assert s.canonical_cmd(cmd, "553690") == cmd, cmd
+
+
+def test_a_resolved_link_is_rebuilt_into_a_marker():
+    """The portal cannot read its own resolved link back.
+
+    Observed: handed one, it looks for the channel id inside, fails, and
+    splices a piece of the URL into the parameter --
+    '...&stream=-portal.example:80/play/live.'. Another provider returns the
+    same parameter empty. Either way the link does not play.
+    """
+    resolved = (
+        "ffmpeg http://portal.example:80/play/live.php?mac=00:1A:79:AA:BB:CC"
+        "&stream=553690&extension=ts&play_token=aaaaaaaaaa"
+    )
+    assert s.canonical_cmd(resolved, "553690") == (
+        "ffmpeg http://localhost/ch/553690_"
+    )
+
+
+def test_the_rewrite_is_what_makes_the_identity_hold_still():
+    """The token rotates on every request; the marker does not.
+
+    One portal produced 647 duplicate streams an hour before this, each sync
+    inventing a new URL for the same channel and stranding the last one.
+    """
+    def resolved(token):
+        return (
+            f"ffmpeg http://host/play/live.php?stream=553690&play_token={token}"
+        )
+
+    first = s.canonical_cmd(resolved("aaaaaaaaaa"), "553690")
+    second = s.canonical_cmd(resolved("bbbbbbbbbb"), "553690")
+    assert first == second, (first, second)
+
+
+def test_nothing_is_rebuilt_without_an_id_to_rebuild_it_from():
+    resolved = "ffmpeg http://host/play/live.php?stream=553690&play_token=x"
+    assert s.canonical_cmd(resolved, "") == resolved
+
+
+def test_a_command_carrying_no_url_is_left_to_the_portal():
+    """VOD commands look like this, and guessing at them would be worse."""
+    for cmd in ("auto /media/1234.mpg", "", "   "):
+        assert s.canonical_cmd(cmd, "553690") == cmd, repr(cmd)
+
+
+def test_the_rewrite_is_reported_on_the_channel():
+    rewritten = s.Portal._channel_from_row(
+        row(cmd="ffmpeg http://host/play/live.php?stream=1&play_token=x")
+    )
+    assert rewritten.cmd == "ffmpeg http://localhost/ch/1_"
+    assert rewritten.cmd_rewritten is True
+
+    untouched = s.Portal._channel_from_row(row(cmd="ffmpeg http://localhost/ch/1_"))
+    assert untouched.cmd_rewritten is False
+
+
 # -- paging --------------------------------------------------------------
 
 

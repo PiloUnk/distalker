@@ -416,6 +416,7 @@ Resolver output otherwise appears in the channel's log, prefixed `[distalker]`:
 | `cannot reach Redis (…); reading the mirrored portal instead` | Informational — playback carried on from the copy on disk. |
 | `cached session rejected` | Normal. The token expired and is being renewed. |
 | `create_link returned an empty command` | The portal refused the channel — often a connection limit or an expired subscription. |
+| `N channel(s) answered with a resolved link rather than a marker, and were rewritten to one` | Informational. That provider hands out playable links where a channel marker belongs; Distalker rebuilds the marker, without which those channels neither play nor keep a stable identity. |
 | `portal returned an empty channel list` | Wrong MAC address or portal URL. Reported only after paging the line-up was tried too and also came back empty. |
 | `the portal would not list its channels in one request … collecting them a page at a time` | Informational. This portal caps or lacks `get_all_channels`, so the sync is reading its line-up page by page. Expect it to take minutes on a large bouquet. |
 | ffmpeg: `Server returned 5XX Server Error reply` | The portal issued a link but refused to serve it. Probe it (below) — usually a connection limit. |

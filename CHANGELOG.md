@@ -56,6 +56,23 @@ credentials will say so.
   than reporting the same message as a portal that answered with something
   unrecognisable — which is now reported as exactly that, and asks to be.
 
+**Playing**
+
+- **Channels a portal answers about with a resolved link now play.** Portals
+  are meant to name a channel with a marker and turn that into a link when
+  asked; some answer with the link itself, and then cannot read it back — one
+  spliced part of the URL into its own stream parameter, another returned that
+  parameter empty. Either way the channel was unplayable. Such a command is now
+  rebuilt into the marker the portal expects.
+- It also stops those channels duplicating. The links carry a token that
+  changes on every request, and Dispatcharr identifies a stream partly by its
+  URL — so every sync invented a new stream and stranded the previous one. One
+  portal was producing 647 duplicates an hour.
+- A command that already looks like a marker is left untouched, which is every
+  channel on every other portal tested — their identities do not move, and no
+  duplicate is created by the fix itself. The sync log says how many were
+  rewritten.
+
 **Connecting**
 
 - **The portal now decides which authentication it gets.** Distalker reads the

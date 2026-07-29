@@ -314,6 +314,49 @@ def as_int(value: Any, default: int = 0) -> int:
         return default
 
 
+# What a Stalker channel's command normally looks like once the prefix is off:
+# a marker naming the channel, which the portal resolves at create_link time.
+# Ministra writes 'http://localhost/ch/<id>_'; the host varies, the shape does
+# not.
+_CANONICAL_CMD = re.compile(r"/ch/\d+_?$")
+
+
+def canonical_cmd(cmd: str, channel_id: str) -> str:
+    """The command as the portal expects to be handed it back.
+
+    Portals are supposed to answer get_all_channels with a marker, and to turn
+    that marker into a playable link when asked. Some answer with the playable
+    link itself -- and then cannot read it back. Observed on one provider:
+
+        create_link('ffmpeg http://host/play/live.php?...&stream=553690&...')
+            -> 'http://host/play/live.php?...&stream=-host:80/play/live.'
+
+    It looks for the channel id inside what it is given, fails, and splices a
+    piece of the URL into the parameter. Another provider answers the same
+    request with the id left empty. Either way the link is unplayable, so a
+    channel synced during one of those replies simply does not work.
+
+    It also breaks the channel's identity. Dispatcharr hashes a stream partly
+    on its URL, ours encodes this command, and these links carry a token that
+    changes on every request -- so each sync invented a new stream and left the
+    previous one behind. One portal produced 647 duplicates an hour.
+
+    So a command that is not a marker is rebuilt into one. Narrow on purpose:
+    a command that already looks like a marker is returned untouched, which is
+    every channel on every other portal tested, and their identities do not
+    move.
+    """
+    if not channel_id:
+        return cmd
+    link = extract_link(cmd)
+    # No URL at all is a shape this does not understand -- VOD commands look
+    # like 'auto /media/file.mpg' -- and guessing at it would be worse than
+    # leaving it to the portal.
+    if not link or _CANONICAL_CMD.search(link):
+        return cmd
+    return f"ffmpeg http://localhost/ch/{channel_id}_"
+
+
 def slugify(value: str) -> str:
     """Reduce a display name to something safe for URLs, keys and filenames."""
     slug = re.sub(r"[^a-z0-9]+", "-", value.strip().lower()).strip("-")
@@ -1116,6 +1159,10 @@ class ChannelEntry:
     # Xtream-shaped, the data is already arriving.
     tv_archive: bool = False
     tv_archive_duration: str = ""
+    # Whether the portal's own command had to be rebuilt into a marker -- see
+    # canonical_cmd. Counted rather than logged per channel, because on the
+    # portal that prompted it, 647 of them arrived at once.
+    cmd_rewritten: bool = False
 
 
 class Portal:
@@ -1580,10 +1627,15 @@ class Portal:
         name = str(row.get("name") or "").strip()
         if not cmd or not name:
             return None
+
+        channel_id = str(row.get("id") or "")
+        marker = canonical_cmd(cmd, channel_id)
+
         return ChannelEntry(
-            channel_id=str(row.get("id") or ""),
+            channel_id=channel_id,
             name=name,
-            cmd=cmd,
+            cmd=marker,
+            cmd_rewritten=marker != cmd,
             logo=str(row.get("logo") or ""),
             genre_id=str(row.get("tv_genre_id") or ""),
             number=str(row.get("number") or ""),

@@ -789,6 +789,18 @@ def sync_portal(
         path,
     )
 
+    rewritten = sum(1 for channel in channels if channel.cmd_rewritten)
+    if rewritten:
+        # Worth saying: this changes what the portal is handed back at tune
+        # time, and it is the difference between a channel that plays and one
+        # that does not on the providers concerned.
+        logger.info(
+            "distalker: %s: %d channel(s) answered with a resolved link rather "
+            "than a marker, and were rewritten to one -- see canonical_cmd",
+            cfg.name,
+            rewritten,
+        )
+
     epg = sync_epg(cfg, portal, channels, logger, trigger_refresh=trigger_refresh)
 
     return {
