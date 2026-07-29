@@ -29,7 +29,7 @@ import tempfile
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import quote, urlparse
+from urllib.parse import quote, urlparse, parse_qs
 
 import requests
 
@@ -1148,6 +1148,19 @@ class Portal:
             )
         return channels
 
+    def get_stream_id(self, cmd: str) -> str:
+        """Extract the StreamId from the cmd.
+        
+        Some providers require the stream ID to be included via the `create_link` action
+        else the returned ffmpeg cmd would have a blank value for stream
+        """
+        parsed = parse_qs(urlparse(cmd).query)
+        if parsed.get('stream'):
+            stream = parsed['stream'][0]
+        else:
+            stream = ""
+        return stream
+
     def create_link(self, cmd: str) -> str:
         """Ask the portal for a playable URL for ``cmd``.
 
@@ -1157,7 +1170,7 @@ class Portal:
         is called at tune time rather than sync time.
         """
         data = self._get_json(
-            f"action=create_link&type=itv&cmd={quote(cmd, safe='')}&JsHttpRequest=1-xml"
+            f"action=create_link&type=itv&stream={self.get_stream_id(cmd)}&cmd={quote(cmd, safe='')}&JsHttpRequest=1-xml"
         )
         js = data.get("js") if isinstance(data, dict) else None
         if not isinstance(js, dict):
