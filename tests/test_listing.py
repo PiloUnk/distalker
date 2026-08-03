@@ -200,6 +200,82 @@ def test_the_rewrite_is_reported_on_the_channel():
     assert untouched.cmd_rewritten is False
 
 
+# -- the same command handed back at tune time ----------------------------
+#
+# The rewrite above only fires on a row carrying an id. Without one -- and on
+# every portal synced before it existed -- the resolved link is still what gets
+# handed back, and this is what the portal does with it.
+
+
+DOUBLED_BASE_CMD = "http://portal.example:80/USER/PASS/1225691"
+DOUBLED_BASE_LINK = (
+    "http://portal.example:80/USER/PASS/USER/PASS/1225691?play_token=deadbeef"
+)
+
+
+def test_a_base_glued_on_twice_is_unglued():
+    """Reported on a portal whose commands are already complete URLs.
+
+    Its create_link prepends its own base to whatever it is handed, so the
+    reply carries /USER/PASS/ twice and answers 401. The command answers 302
+    and plays.
+    """
+    assert s.undoubled_link(DOUBLED_BASE_CMD, DOUBLED_BASE_LINK) == DOUBLED_BASE_CMD
+    assert s.undoubled_link(
+        f"ffmpeg {DOUBLED_BASE_CMD}", DOUBLED_BASE_LINK
+    ) == DOUBLED_BASE_CMD
+
+
+def test_a_portal_that_answers_properly_keeps_its_token():
+    """What every working portal does, and the one case a mistake would break.
+
+    The token is the whole point of resolving at tune time, so a rule that
+    dropped it on an ordinary answer would be worse than the bug it fixes.
+    """
+    for cmd, link in (
+        # The same path, with the token added.
+        (DOUBLED_BASE_CMD, DOUBLED_BASE_CMD + "?play_token=deadbeef"),
+        # A marker resolved to somewhere else entirely: the shape this plugin
+        # sees on every portal that behaves.
+        ("ffmpeg http://localhost/ch/1225691_",
+         "http://portal.example:80/USER/PASS/1225691?play_token=deadbeef"),
+        # Same path, another host -- a provider streaming from its edge.
+        ("http://portal.example/live/1", "http://edge.example/live/1?token=x"),
+        # A repetition that is not the base: '/a' answering '/a/a' is a
+        # different channel, not a doubled prefix.
+        ("http://h/a", "http://h/a/a?token=x"),
+        # Nothing to compare against.
+        ("auto /media/1234.mpg", "http://h/play?token=x"),
+        ("", "http://h/play?token=x"),
+    ):
+        assert s.undoubled_link(cmd, link) == link, (cmd, link)
+
+
+def test_the_ungluing_happens_where_the_portal_answers():
+    """create_link is where the doubled path is seen, and it says so.
+
+    The resolver prints the portal's warnings on the tune's stderr, which is
+    the only place this is visible on a live install.
+    """
+    p = portal()
+    p._get_json = lambda q, with_auth=True: {"js": {"cmd": f"ffmpeg {DOUBLED_BASE_LINK}"}}
+
+    assert p.create_link(DOUBLED_BASE_CMD) == DOUBLED_BASE_CMD
+    assert any("already a link" in w for w in p.warnings), p.warnings
+
+
+def test_an_answer_that_needed_nothing_is_not_remarked_on():
+    p = portal()
+    p._get_json = lambda q, with_auth=True: {
+        "js": {"cmd": "ffmpeg http://portal.example/live/1?play_token=x"}
+    }
+
+    assert p.create_link("ffmpeg http://localhost/ch/1_") == (
+        "http://portal.example/live/1?play_token=x"
+    )
+    assert p.warnings == []
+
+
 # -- paging --------------------------------------------------------------
 
 

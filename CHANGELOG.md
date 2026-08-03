@@ -83,6 +83,15 @@ credentials will say so.
   channel on every other portal tested — their identities do not move, and no
   duplicate is created by the fix itself. The sync log says how many were
   rewritten.
+- **The same portals are also caught at tune time.** The rewrite above needs
+  the portal to number its channels; a listing that does not still hands back a
+  resolved link, as does every portal synced before this release. One family of
+  them answers by gluing its own base in front of whatever it was given, so a
+  command that was already a URL comes back with `/user/pass/` twice and gets
+  401 — while the command itself plays. That reply is now recognised by its
+  shape and the command played instead, with a line on the channel's log
+  saying so. Nothing is asked of the provider to decide it: a check request
+  would take a connection slot from the tune that is about to need it.
 
 **Connecting**
 

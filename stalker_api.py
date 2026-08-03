@@ -357,6 +357,54 @@ def canonical_cmd(cmd: str, channel_id: str) -> str:
     return f"ffmpeg http://localhost/ch/{channel_id}_"
 
 
+def undoubled_link(cmd: str, link: str) -> str:
+    """The link the portal meant, once its own base is unglued from it.
+
+    The same illness as :func:`canonical_cmd`, caught at the other end. A
+    portal that answered the listing with a resolved link is handed one back at
+    create_link, and one family of them builds its reply by gluing its base in
+    front of whatever it was given -- so a command that was already a complete
+    URL comes back carrying that base twice::
+
+        create_link('http://portal.example:80/USER/PASS/1225691')
+            -> 'http://portal.example:80/USER/PASS/USER/PASS/1225691?play_token=...'
+
+    That path answers 401. The command itself answers 302 and plays, so the
+    command is what is returned, and the reply is dropped with its token: the
+    token was minted for a path that does not exist.
+
+    ``canonical_cmd`` heads this off at sync time and is the better cure, but
+    it only fires on rows carrying an id -- a listing without one still stores
+    the resolved link, as does every portal synced before it existed.
+
+    Structural on purpose, and settled without asking the provider anything. A
+    probe request would answer the question outright, and cost a connection
+    slot at the exact moment the tune needs it: providers count those, and a
+    subscription with one line would spend it here and fail the playback it was
+    checking for.
+
+    Narrow, because a false positive throws a good token away: same scheme and
+    host, and the reply's path has to be the command's path exactly, behind a
+    prefix that is itself a directory of it. Everything else is returned as it
+    came -- including the ordinary case of a portal answering the same path
+    with a token added, which is what a working one does.
+    """
+    cmd_link = extract_link(cmd)
+    if not cmd_link or not link:
+        return link
+
+    meant, answered = urlparse(cmd_link), urlparse(link)
+    if (meant.scheme, meant.netloc) != (answered.scheme, answered.netloc):
+        return link
+    if not meant.path or not answered.path.endswith(meant.path):
+        return link
+
+    prefix = answered.path[: -len(meant.path)].rstrip("/")
+    if prefix and meant.path.startswith(prefix + "/"):
+        return cmd_link
+    return link
+
+
 def slugify(value: str) -> str:
     """Reduce a display name to something safe for URLs, keys and filenames."""
     slug = re.sub(r"[^a-z0-9]+", "-", value.strip().lower()).strip("-")
@@ -1879,6 +1927,15 @@ class Portal:
         link = extract_link(raw)
         if not link:
             raise PortalError(f"create_link returned an unusable command: {raw[:200]}")
+
+        unglued = undoubled_link(cmd, link)
+        if unglued != link:
+            self.warnings.append(
+                f"the portal answered with its own base in front of a command "
+                f"that was already a link ({link[:160]}); that path does not "
+                "exist, so the command itself is what plays"
+            )
+            return unglued
         return link
 
     def logo_url(self, logo: str) -> str:
