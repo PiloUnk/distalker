@@ -30,7 +30,7 @@ import time
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import quote, urlparse
+from urllib.parse import parse_qs, quote, urlparse
 
 import requests
 
@@ -318,7 +318,7 @@ def as_int(value: Any, default: int = 0) -> int:
 # a marker naming the channel, which the portal resolves at create_link time.
 # Ministra writes 'http://localhost/ch/<id>_'; the host varies, the shape does
 # not.
-_CANONICAL_CMD = re.compile(r"/ch/\d+_?$")
+_CANONICAL_CMD = re.compile(r"/ch/(\d+)_?$")
 
 
 def canonical_cmd(cmd: str, channel_id: str) -> str:
@@ -403,6 +403,38 @@ def undoubled_link(cmd: str, link: str) -> str:
     if prefix and meant.path.startswith(prefix + "/"):
         return cmd_link
     return link
+
+
+def stream_id(cmd: str) -> str:
+    """The channel's own number, read back out of the command, or "".
+
+    Named in the create_link request alongside the command, because a portal
+    that cannot find the channel in the command answers about no channel at
+    all: one returns the link with its ``stream`` parameter left empty, which
+    plays nothing. Reported and first fixed by @shayward, whose providers need
+    it on every request.
+
+    Read from the two shapes a command takes here. The marker is what a portal
+    is meant to send and what :func:`canonical_cmd` rebuilds, so it is the only
+    one left after a sync -- reading the query alone would leave exactly the
+    installs that need this without it. The query is what an unrewritten
+    command carries, which is every portal synced before that existed.
+
+    Whatever comes back is the portal's own number for the channel, taken from
+    what the portal itself wrote: this cannot name it a channel it did not name
+    first. An id that is not there at all gives "", and nothing is sent --
+    an empty parameter is a question no portal asked to be asked.
+    """
+    link = extract_link(cmd)
+    if not link:
+        return ""
+
+    marker = _CANONICAL_CMD.search(urlparse(link).path)
+    if marker:
+        return marker.group(1)
+
+    found = parse_qs(urlparse(link).query).get("stream") or [""]
+    return found[0].strip()
 
 
 def slugify(value: str) -> str:
@@ -1903,10 +1935,19 @@ class Portal:
         ``"ffmpeg http://host/stream.m3u8?token=..."`` -- so :func:`extract_link`
         finds the playable part. These links are short-lived, which is why this
         is called at tune time rather than sync time.
+
+        The channel is named twice where it can be: in the command, and in a
+        ``stream`` parameter beside it. Ministra reads the command and ignores
+        the rest; the portals that do not answer about no channel at all
+        without it -- see :func:`stream_id`. Only ever sent with a value, so a
+        portal that never asked for it sees the request it has always seen.
         """
-        data = self._get_json(
-            f"action=create_link&type=itv&cmd={quote(cmd, safe='')}&JsHttpRequest=1-xml"
-        )
+        query = f"action=create_link&type=itv&cmd={quote(cmd, safe='')}"
+        channel = stream_id(cmd)
+        if channel:
+            query += f"&stream={quote(channel, safe='')}"
+
+        data = self._get_json(f"{query}&JsHttpRequest=1-xml")
         js = data.get("js") if isinstance(data, dict) else None
         # Typed as auth failures, both of them, because that is overwhelmingly
         # what they are: a portal whose token has expired usually answers

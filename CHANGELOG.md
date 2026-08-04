@@ -92,6 +92,15 @@ credentials will say so.
   shape and the command played instead, with a line on the channel's log
   saying so. Nothing is asked of the provider to decide it: a check request
   would take a connection slot from the tune that is about to need it.
+- **The channel is now named in the request as well as in the command.** Some
+  providers cannot find it in the command they are handed back and answer about
+  no channel at all — the link arrives with its stream number left empty, and
+  plays nothing. Both shapes a command takes here carry that number, and it is
+  sent alongside, so those portals resolve the channel that was asked for.
+  Reported and first fixed by [@shayward](https://github.com/shayward).
+- Sent only when there is one to send, so a portal that never needed it sees
+  the request it has always seen, and the number can only ever be one the
+  portal itself wrote.
 
 **Connecting**
 

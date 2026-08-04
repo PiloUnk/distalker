@@ -276,6 +276,81 @@ def test_an_answer_that_needed_nothing_is_not_remarked_on():
     assert p.warnings == []
 
 
+# -- naming the channel in the request as well ----------------------------
+#
+# A portal that cannot find the channel in the command answers about no
+# channel at all: one returns the link with its stream parameter left empty.
+# Reported and first fixed by @shayward, on providers that need it every time.
+
+
+def asking(cmd):
+    """The create_link query a portal would be sent for ``cmd``."""
+    p = portal()
+    sent = []
+    p._get_json = lambda q, with_auth=True: (
+        sent.append(q) or {"js": {"cmd": "ffmpeg http://host/play?token=x"}}
+    )
+    p.create_link(cmd)
+    return sent[0]
+
+
+def test_the_channel_is_named_from_the_marker():
+    """The only shape left after a sync, so reading the query alone would
+    leave exactly the installs that need this without it."""
+    assert "&stream=553690&" in asking("ffmpeg http://localhost/ch/553690_")
+
+
+def test_the_channel_is_named_from_an_unrewritten_command():
+    """Every portal synced before canonical_cmd existed still carries this."""
+    assert "&stream=553690&" in asking(
+        "ffmpeg http://host/play/live.php?mac=00:1A:79:AA:BB:CC&stream=553690"
+    )
+
+
+def test_a_command_naming_no_channel_adds_nothing_to_the_request():
+    """The neutrality that makes this safe to send to everybody.
+
+    An empty parameter is a question no portal asked to be asked, and this
+    runs against every provider, not the two that reported the problem.
+    """
+    for cmd in (
+        "ffmpeg http://host/play/live.php?token=x",
+        "http://portal.example:80/USER/PASS/1225691",
+        "auto /media/1234.mpg",
+        "",
+    ):
+        assert "stream=" not in asking(cmd), cmd
+
+
+def test_a_quoted_command_does_not_smuggle_its_quote_into_the_query():
+    """A quoted URL is a real shape -- extract_link exists because of it --
+    and reading the query off the raw command carries the closing quote in."""
+    query = asking('ffmpeg "http://host/play/live.php?stream=553690"')
+    assert "&stream=553690&" in query, query
+
+
+def test_the_channel_number_is_escaped_like_the_command_beside_it():
+    """Whatever the portal wrote, it goes back as one parameter and not two."""
+    query = asking("ffmpeg http://host/play/live.php?stream=55%263690")
+    assert "&stream=55%263690&" in query, query
+
+
+def test_reading_the_channel_out_of_a_command():
+    for cmd, expected in (
+        ("ffmpeg http://localhost/ch/553690_", "553690"),
+        ("http://localhost/ch/553690", "553690"),
+        ("ffmpeg http://host/play/live.php?stream=553690&extension=ts", "553690"),
+        # The marker wins: after a sync it is the only one there, and a
+        # command carrying both was resolved from that same number anyway.
+        ("ffmpeg http://localhost/ch/553690_?stream=1", "553690"),
+        ("ffmpeg http://host/play/live.php?stream=&extension=ts", ""),
+        ("ffmpeg http://host/play/live.php", ""),
+        ("auto /media/1234.mpg", ""),
+        ("", ""),
+    ):
+        assert s.stream_id(cmd) == expected, cmd
+
+
 # -- paging --------------------------------------------------------------
 
 
