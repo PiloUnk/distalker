@@ -69,19 +69,33 @@ def resolve(slug: str, cmd: str) -> tuple[str, stalker_api.PortalConfig]:
 
     if cached:
         # Optimistic path: reuse the cached token and skip the handshake.
+        #
+        # Only an actual refusal is worth a second attempt. A portal that is
+        # unreachable or answering with rubbish will do the same during the
+        # handshake, and a tune that spends two round-trips discovering that is
+        # a tune Dispatcharr spends not failing over to the next source.
         try:
             link = portal.create_link(cmd)
-            return link, cfg
-        except PortalError as exc:
+        except stalker_api.PortalAuthError as exc:
             log(f"cached session rejected ({exc}); re-authenticating")
             stalker_api.clear_cached_token(slug, client)
             portal = stalker_api.Portal(cfg)
+        else:
+            for warning in portal.warnings:
+                log(f"{slug}: {warning}")
+            return link, cfg
 
     portal.login()
+    # Cached before the link is asked for, not after: the token is good either
+    # way, and a create_link that fails must not cost the next tune a second
+    # handshake to learn the same thing.
+    stalker_api.set_cached_token(slug, portal.token, ttl=3600, client=client)
+    link = portal.create_link(cmd)
+    # After the link, so that what create_link has to say about the portal's
+    # answer is reported too, and not only what login() found.
     for warning in portal.warnings:
         log(f"{slug}: {warning}")
-    stalker_api.set_cached_token(slug, portal.token, ttl=3600, client=client)
-    return portal.create_link(cmd), cfg
+    return link, cfg
 
 
 def build_ffmpeg_command(cfg: stalker_api.PortalConfig, url: str) -> list:

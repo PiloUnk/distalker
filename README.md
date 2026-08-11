@@ -159,6 +159,11 @@ URL:
 | `http://host/…/load.php` | unchanged — explicit endpoints are preserved |
 | `http://host/c/other.php` | `http://host/c/portal.php` |
 
+If that path turns out not to be where the portal answers, Distalker tries the
+other one Ministra uses — `…/c/portal.php` and `…/server/load.php` are swapped
+for each other — and logs which one worked. Putting the working one on the
+portal line saves a failed request on every sync.
+
 Anything unusual goes in trailing `key=value` pairs, separated by spaces or
 further `|` characters, quoted where a value contains spaces
 (`password="two words"`):
@@ -168,6 +173,8 @@ further `|` characters, quoted where a value contains spaces
 | `username` | Portal login, if your provider issued one | — |
 | `password` | Portal password | — |
 | `max_streams` | Concurrent connections allowed for this MAC | `1` |
+| `epg` | `epg=1` fetches this portal's programme guide — see below | off |
+| `epg_hours` | How much guide to ask for, in hours | `24` |
 | *STB keys* | `model`, `serial`, `device_id`, `device_id2`, `signature`, `timezone` — see below | MAG254 |
 
 > **`max_streams` cannot be detected.** Portals do not tell the box what the
@@ -193,9 +200,9 @@ http://portal.example.com/c/ | 00:1A:79:AA:BB:CC | model=MAG322 timezone=Europe/
 | --- | --- | --- |
 | `model` | `MAG254` | Sent as the `X-User-Agent` device model. Also `MAG250`, `MAG322`, … |
 | `serial` | `0000000000000` | Portal cookie `sn`. |
-| `device_id` | 64 × `f` | Sent during device-ID authentication. |
+| `device_id` | 64 × `f` | Sent with the box's profile, and with credentials. |
 | `device_id2` | same as `device_id` | Most boxes carry the same value in both slots. |
-| `signature` | 64 × `f` | Accepted, but **currently unused**: no request Distalker makes includes it. |
+| `signature` | 64 × `f` | Sent with the box's profile. |
 | `timezone` | `UTC` | Portal cookie `timezone`, e.g. `Europe/Paris`. |
 
 > **These are the untested part of this plugin.** Every portal it has run
@@ -204,11 +211,20 @@ http://portal.example.com/c/ | 00:1A:79:AA:BB:CC | model=MAG322 timezone=Europe/
 > gets it wrong, that is a bug worth reporting with the values your provider
 > gave you.
 
-Which authentication runs is decided by one thing — whether you supplied
-credentials. With a username *and* password: handshake, then `do_auth`. Without:
-handshake, then a device-ID step. A failed device-ID step is **not fatal**, as
-plenty of portals authorise on the MAC alone; if the session really is
-unauthorised, the channel fetch says so straight after, and far more clearly.
+**The portal decides which authentication runs**, not the settings. Distalker
+shakes hands, presents the box's profile, and does what the answer asks for:
+nothing more if the portal is satisfied, or `do_auth` with your username and
+password if it says it wants them. If it refuses the account outright, the
+message you get is the provider's own — "subscription expired", "blocked" —
+rather than a guess made here.
+
+So credentials on a portal line are there for the portals that ask; a portal
+that never asks ignores them. Two consequences worth knowing:
+
+- A portal that asks for credentials **and has none on its line** now fails the
+  sync, saying so. It used to fetch an empty channel list and blame the MAC.
+- A portal that has no profile endpoint at all — some do not — still works, with
+  a warning in the log, on the strength of the MAC alone.
 
 ### Other settings
 
@@ -218,7 +234,7 @@ You should not need any of these.
 | --- | --- | --- |
 | ffmpeg arguments | a plain remux, plus the MAG headers and `-rw_timeout` | Placeholders `{url}`, `{ua}`, `{referer}`, `{headers}`. Must write MPEG-TS to `pipe:1`. **Do not add `-reconnect`** — it retries a link that has already expired, and stops Dispatcharr failing over to the channel's other sources. |
 | Fallback stream profile | `ffmpeg` | Plays the *other* sources on a Distalker channel — see below. |
-| Portal request timeout | `60` s | Every portal request, sync and tune alike. Raise it if a busy portal times out assembling its channel list. |
+| Portal request timeout | `60` s | Every portal request, sync and tune alike. Raise it if a busy portal times out assembling its channel list. A sync retries twice on top of this — 1 s then 2 s apart — so raising it far also lengthens the worst case of a failing sync. |
 | Auto-assign stream profile | on | Gives a channel the Distalker profile as it gains a portal stream, after each M3U refresh, and once more after any channel fails to start. |
 
 ### Channels that mix a portal with another provider
@@ -264,8 +280,9 @@ button you should need.
 ### Sync only fetches what changed
 
 A line-up is one request per portal that a busy provider can take minutes to
-assemble, so re-downloading portals that did not change is time spent for
-nothing:
+assemble — and on portals that refuse to list everything at once, hundreds of
+requests instead, collected page by page. Either way, re-downloading portals
+that did not change is time spent for nothing:
 
 | Your line | What Sync does |
 | --- | --- |
@@ -308,11 +325,72 @@ dates natively. If the portal reports the account as blocked, the line says so
 in capitals: a blocked account otherwise looks exactly like an empty channel
 list.
 
+### Refreshing on a schedule
+
+Set **Refresh every (hours)** and Distalker re-fetches every portal on that
+interval — channels, and the guide on lines carrying `epg=1`. At `0`, the
+default, nothing happens on its own and Sync stays a button.
+
+There is no timer inside the plugin. The setting is written to the refresh
+interval of the M3U accounts it owns; Dispatcharr schedules those itself, and
+the event it emits after each one is what wakes Distalker to re-fetch the
+portal behind it. Two consequences worth knowing:
+
+- **Below one hour is refused.** A scheduled run blocks the next for thirty
+  minutes, because a sync ends by asking Dispatcharr to re-read the playlist it
+  just wrote — and that re-read emits the same event. The cooldown is what
+  stops the pair going round for ever.
+- Refreshing an M3U account by hand also triggers it, if the account is one of
+  Distalker's and the last scheduled run was over half an hour ago.
+
+### Programme guide
+
+Add `epg=1` to a portal line and the next sync also fetches its guide, writes
+an XMLTV file, and registers it under **EPGs** as `Distalker: <portal>` — the
+same arrangement as the M3U account it creates for the channels. Dispatcharr
+then matches programmes to channels on the `tvg-id` the playlist already
+carries, so nothing needs mapping by hand.
+
+```
+Living room | http://portal.example/c/ | 00:1A:79:AA:BB:CC | epg=1
+Living room | http://portal.example/c/ | 00:1A:79:AA:BB:CC | epg=1 epg_hours=48
+```
+
+**It is off by default because it is expensive.** A portal answers `get_epg_info`
+for its *entire* line-up in one response: on a 13,000-channel portal, a single
+day is on the order of 100 MB, and the period multiplies that directly. Start at
+the default 24 hours and raise it only if your portal copes. Beyond 200 MB the
+download is abandoned with a message telling you to lower `epg_hours`.
+
+**Not every portal has one.** A provider can carry thousands of channels and no
+programmes for any of them; it answers with an empty guide and the log says so,
+suggesting you drop `epg=1` from that line. Some serve a guide one channel at a
+time instead of as a whole grid — Distalker does not use that, because it costs
+one request per channel and, where it was measured, covered almost none of the
+channels anyone had actually configured.
+
+A guide that fails — too large, refused, in a shape this does not recognise — is
+logged and skipped. It never fails the sync around it, so you keep the channel
+list either way.
+
+Channels the portal has no programmes for are left out of the file rather than
+written empty, and turning `epg=1` off again deactivates the EPG source without
+deleting it.
+
 ## Limitations
 
 - **Live TV only.** No VOD, no series.
-- **No EPG yet.** Generated `tvg-id`s are stable (`<slug>.<channel-id>`), so EPG
-  can be added later without disturbing existing streams.
+- **Programme guides are supported only where a portal serves a whole grid.**
+  `get_epg_info` answers for the entire line-up in one request, and that is the
+  only shape Distalker reads. Portals that instead serve a guide one channel at
+  a time are not covered: it costs one request per channel, and where it was
+  measured across twelve portals it covered none of the channels that had
+  actually been configured. Those portals report having no guide, which for
+  practical purposes is what it amounts to.
+- **Scheduling is borrowed, not built.** A plugin cannot register a Celery task
+  a stock Dispatcharr can run, so *Refresh every (hours)* drives the M3U
+  accounts' own refresh interval and answers the event that follows. It works,
+  and it is why the interval cannot usefully go below an hour.
 - **Credentials are stored unencrypted**, in the Dispatcharr database and on
   disk — see [What it writes, and where](#what-it-writes-and-where).
 - **No session keep-alive.** A cached token is reused and re-issued on demand.
@@ -338,7 +416,10 @@ Resolver output otherwise appears in the channel's log, prefixed `[distalker]`:
 | `cannot reach Redis (…); reading the mirrored portal instead` | Informational — playback carried on from the copy on disk. |
 | `cached session rejected` | Normal. The token expired and is being renewed. |
 | `create_link returned an empty command` | The portal refused the channel — often a connection limit or an expired subscription. |
-| `portal returned an empty channel list` | Wrong MAC address or portal URL. |
+| `N channel(s) answered with a resolved link rather than a marker, and were rewritten to one` | Informational. That provider hands out playable links where a channel marker belongs; Distalker rebuilds the marker, without which those channels neither play nor keep a stable identity. |
+| `the portal answered with its own base in front of a command that was already a link` | Informational. Same provider habit as the row above, seen at tune time: it built the link by repeating its own `/user/pass/` path, which answers 401. Distalker plays the channel's own command instead, which is what that path resolves to. |
+| `portal returned an empty channel list` | Wrong MAC address or portal URL. Reported only after paging the line-up was tried too and also came back empty. |
+| `the portal would not list its channels in one request … collecting them a page at a time` | Informational. This portal caps or lacks `get_all_channels`, so the sync is reading its line-up page by page. Expect it to take minutes on a large bouquet. |
 | ffmpeg: `Server returned 5XX Server Error reply` | The portal issued a link but refused to serve it. Probe it (below) — usually a connection limit. |
 
 **Nothing plays and you see 503 / "max connections".** Every viewer, preview,

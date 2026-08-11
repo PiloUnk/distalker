@@ -23,7 +23,7 @@ spec = importlib.util.spec_from_file_location("resolver", os.path.join(REPO, "re
 resolver = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(resolver)
 
-PORTAL_URL = s.encode_pseudo_url("weaseltv", "ffmpeg http://portal.example/live/1")
+PORTAL_URL = s.encode_pseudo_url("livingroom", "ffmpeg http://portal.example/live/1")
 XTREAM_URL = "http://xtream.example:8080/live/user/pass/123.ts"
 
 
@@ -45,7 +45,7 @@ class FakeRedis:
 def test_our_own_urls_are_recognised():
     assert s.is_pseudo_url(PORTAL_URL)
     slug, cmd = s.decode_pseudo_url(PORTAL_URL)
-    assert slug == "weaseltv"
+    assert slug == "livingroom"
 
 
 def test_another_providers_url_is_not_ours():

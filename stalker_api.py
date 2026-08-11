@@ -26,10 +26,11 @@ import shlex
 import shutil
 import sys
 import tempfile
+import time
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import quote, urlparse
+from urllib.parse import parse_qs, quote, urlparse
 
 import requests
 
@@ -45,6 +46,69 @@ DEFAULT_SERIAL = "0000000000000"
 DEFAULT_DEVICE_ID = "f" * 64
 DEFAULT_SIGNATURE = "f" * 64
 DEFAULT_TIMEZONE = "UTC"
+
+# The rest of what a MAG box tells get_profile about itself. Fixed rather than
+# configurable: these describe a firmware image, not an account, and a portal
+# that cared would want them to agree with each other -- which they only do as
+# the block libstalkerclient has been sending since 2015 (lib/libstalkerclient/
+# stb.c, `sc_stb_get_profile_defaults`). They describe a MAG250 image even when
+# stb_type says MAG254; no portal has ever been seen to cross-check the two,
+# and every Stalker client in the wild sends this same mismatch.
+STB_VERSION = (
+    "ImageDescription: 0.2.16-250; "
+    "ImageDate: 18 Mar 2013 19:56:53 GMT+0200; "
+    "PORTAL version: 4.9.9; "
+    "API Version: JS API version: 328; "
+    "STB API version: 134; "
+    "Player Engine version: 0x566"
+)
+STB_IMAGE_VERSION = 216
+STB_HW_VERSION = "1.7-BD-00"
+STB_NUM_BANKS = 1
+
+# What a portal answers with, in plain text and with no JSON around it, once
+# the token it was given is no longer good. Matched exactly because it is a
+# fixed string in Ministra rather than something a reseller writes.
+AUTH_FAILED_BODY = "authorization failed."
+
+# Answers worth asking again for. Everything else is the portal having made up
+# its mind: a 404 is not going to become a 200, and a 403 is the subject of
+# PortalAuthError, which must never be retried -- repeating a rejected login is
+# how a MAC gets itself banned.
+#
+# 500 is in the list and is the debatable one. Ministra returns it both for
+# "busy right now" and for some permanent failures, so a third of these retries
+# will be spent on something that cannot succeed. Three attempts is a small
+# enough bill for covering the transient half.
+RETRYABLE_STATUS = frozenset({429, 500, 502, 503, 504})
+
+# Hours of guide asked for when a portal line says 'epg=1' without saying how
+# much. pvr.stalker holds itself to the same figure, and its own comment says
+# why: get_epg_info answers for the *entire* line-up in one response, so the
+# period is a direct multiplier on a download that is already the largest thing
+# this plugin ever makes.
+DEFAULT_EPG_HOURS = 24
+
+# Refuse a guide bigger than this rather than discover the limit by having the
+# worker killed. A 13,000-channel portal answers with something like 100 MB for
+# a day, and the parsed form of that costs several times more again -- so this
+# is not a generous allowance, it is the point past which the sensible thing is
+# to say so and keep the channel list, which matters more than the guide.
+EPG_MAX_BYTES = 200 * 1024 * 1024
+
+# Last-resort bound on the paginated channel listing, for a portal that keeps
+# answering with something new and never says how much there is. Deliberately
+# far above any real line-up: whenever the portal reports 'total_items' the
+# computed page count wins long before this, and the two cheaper guards --
+# an empty page, a page that repeats one already read -- stop nearly everything
+# else. This only catches a portal generating rubbish indefinitely.
+ORDERED_LIST_PAGE_CAP = 1000
+
+# Seconds before the 1st, 2nd and 3rd retry. Fixed rather than jittered: the
+# calls that retry are made one portal at a time from a single process, so
+# there is no herd to spread out, and a deterministic delay is one a test can
+# assert on.
+RETRY_BACKOFF = (1.0, 2.0, 4.0)
 
 # Seconds to wait on any single portal request. Generous by HTTP standards
 # because get_all_channels is one request for the entire line-up, and a busy
@@ -148,6 +212,26 @@ class PortalError(Exception):
     """Raised when the portal rejects us or answers with nonsense."""
 
 
+class PortalEndpointError(PortalError):
+    """Something answered, but it was not a Stalker API.
+
+    A 404, or a body that is not JSON at all. Separated because it is the one
+    failure with a second thing worth trying: the same portal on its other
+    path -- see :func:`alternate_endpoint`.
+    """
+
+
+class PortalAuthError(PortalError):
+    """The portal understood us and refused the session.
+
+    Separated from its parent because the two want opposite handling: a
+    transport failure is worth retrying, an account the portal has declined is
+    not, and only the second is worth repeating verbatim to the user -- the
+    portal's own wording ("blocked", "subscription expired") says more than
+    anything this plugin could infer.
+    """
+
+
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
@@ -168,12 +252,13 @@ class PortalConfig:
     serial_number: str = DEFAULT_SERIAL
     model: str = DEFAULT_MODEL
     timezone: str = DEFAULT_TIMEZONE
-    # Accepted for parity with stalkerhek's profile settings. stalkerhek only
-    # ever sends it from its STB proxy mode (proxy/proxy.go); none of the
-    # handshake / auth / create_link requests this plugin makes include it.
     signature: str = DEFAULT_SIGNATURE
-    device_id_auth: bool = False
     max_streams: int = 1
+    # Off unless the line says otherwise. One guide is a bigger download than
+    # everything else this plugin fetches put together, so it is asked for
+    # rather than assumed -- see DEFAULT_EPG_HOURS.
+    epg: bool = False
+    epg_hours: int = DEFAULT_EPG_HOURS
     ffmpeg_args: str = DEFAULT_FFMPEG_ARGS
     # Travels to Redis with the rest, so the resolver waits as long as the sync
     # does rather than giving up on a portal the sync copes with.
@@ -215,6 +300,141 @@ def extract_link(raw: str) -> str:
         if _LINK_RE.match(candidate):
             return candidate
     return ""
+
+
+def as_int(value: Any, default: int = 0) -> int:
+    """An int from whatever the portal felt like sending.
+
+    Numbers arrive as numbers on some portals and as strings on others, often
+    both within one response, so nothing that reads a count can assume either.
+    """
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError):
+        return default
+
+
+# What a Stalker channel's command normally looks like once the prefix is off:
+# a marker naming the channel, which the portal resolves at create_link time.
+# Ministra writes 'http://localhost/ch/<id>_'; the host varies, the shape does
+# not.
+_CANONICAL_CMD = re.compile(r"/ch/(\d+)_?$")
+
+
+def canonical_cmd(cmd: str, channel_id: str) -> str:
+    """The command as the portal expects to be handed it back.
+
+    Portals are supposed to answer get_all_channels with a marker, and to turn
+    that marker into a playable link when asked. Some answer with the playable
+    link itself -- and then cannot read it back. Observed on one provider:
+
+        create_link('ffmpeg http://host/play/live.php?...&stream=553690&...')
+            -> 'http://host/play/live.php?...&stream=-host:80/play/live.'
+
+    It looks for the channel id inside what it is given, fails, and splices a
+    piece of the URL into the parameter. Another provider answers the same
+    request with the id left empty. Either way the link is unplayable, so a
+    channel synced during one of those replies simply does not work.
+
+    It also breaks the channel's identity. Dispatcharr hashes a stream partly
+    on its URL, ours encodes this command, and these links carry a token that
+    changes on every request -- so each sync invented a new stream and left the
+    previous one behind. One portal produced 647 duplicates an hour.
+
+    So a command that is not a marker is rebuilt into one. Narrow on purpose:
+    a command that already looks like a marker is returned untouched, which is
+    every channel on every other portal tested, and their identities do not
+    move.
+    """
+    if not channel_id:
+        return cmd
+    link = extract_link(cmd)
+    # No URL at all is a shape this does not understand -- VOD commands look
+    # like 'auto /media/file.mpg' -- and guessing at it would be worse than
+    # leaving it to the portal.
+    if not link or _CANONICAL_CMD.search(link):
+        return cmd
+    return f"ffmpeg http://localhost/ch/{channel_id}_"
+
+
+def undoubled_link(cmd: str, link: str) -> str:
+    """The link the portal meant, once its own base is unglued from it.
+
+    The same illness as :func:`canonical_cmd`, caught at the other end. A
+    portal that answered the listing with a resolved link is handed one back at
+    create_link, and one family of them builds its reply by gluing its base in
+    front of whatever it was given -- so a command that was already a complete
+    URL comes back carrying that base twice::
+
+        create_link('http://portal.example:80/USER/PASS/1225691')
+            -> 'http://portal.example:80/USER/PASS/USER/PASS/1225691?play_token=...'
+
+    That path answers 401. The command itself answers 302 and plays, so the
+    command is what is returned, and the reply is dropped with its token: the
+    token was minted for a path that does not exist.
+
+    ``canonical_cmd`` heads this off at sync time and is the better cure, but
+    it only fires on rows carrying an id -- a listing without one still stores
+    the resolved link, as does every portal synced before it existed.
+
+    Structural on purpose, and settled without asking the provider anything. A
+    probe request would answer the question outright, and cost a connection
+    slot at the exact moment the tune needs it: providers count those, and a
+    subscription with one line would spend it here and fail the playback it was
+    checking for.
+
+    Narrow, because a false positive throws a good token away: same scheme and
+    host, and the reply's path has to be the command's path exactly, behind a
+    prefix that is itself a directory of it. Everything else is returned as it
+    came -- including the ordinary case of a portal answering the same path
+    with a token added, which is what a working one does.
+    """
+    cmd_link = extract_link(cmd)
+    if not cmd_link or not link:
+        return link
+
+    meant, answered = urlparse(cmd_link), urlparse(link)
+    if (meant.scheme, meant.netloc) != (answered.scheme, answered.netloc):
+        return link
+    if not meant.path or not answered.path.endswith(meant.path):
+        return link
+
+    prefix = answered.path[: -len(meant.path)].rstrip("/")
+    if prefix and meant.path.startswith(prefix + "/"):
+        return cmd_link
+    return link
+
+
+def stream_id(cmd: str) -> str:
+    """The channel's own number, read back out of the command, or "".
+
+    Named in the create_link request alongside the command, because a portal
+    that cannot find the channel in the command answers about no channel at
+    all: one returns the link with its ``stream`` parameter left empty, which
+    plays nothing. Reported and first fixed by @shayward, whose providers need
+    it on every request.
+
+    Read from the two shapes a command takes here. The marker is what a portal
+    is meant to send and what :func:`canonical_cmd` rebuilds, so it is the only
+    one left after a sync -- reading the query alone would leave exactly the
+    installs that need this without it. The query is what an unrewritten
+    command carries, which is every portal synced before that existed.
+
+    Whatever comes back is the portal's own number for the channel, taken from
+    what the portal itself wrote: this cannot name it a channel it did not name
+    first. An id that is not there at all gives "", and nothing is sent --
+    an empty parameter is a question no portal asked to be asked.
+    """
+    link = extract_link(cmd)
+    if not link:
+        return ""
+
+    marker = _CANONICAL_CMD.search(urlparse(link).path)
+    if marker:
+        return marker.group(1)
+
+    found = parse_qs(urlparse(link).query).get("stream") or [""]
+    return found[0].strip()
 
 
 def slugify(value: str) -> str:
@@ -408,6 +628,19 @@ def parse_portals(text: str) -> Tuple[List[PortalConfig], List[str]]:
             errors.append(f"line {lineno}: max_streams must be a number")
             continue
 
+        # 'epg=1', 'epg=true', 'epg=yes' all mean the same thing to someone
+        # typing it from memory, so all of them are accepted; anything else
+        # -- including 'epg=0' -- leaves it off.
+        epg = extras.get("epg", "").strip().lower() in ("1", "true", "yes", "on")
+        try:
+            epg_hours = int(extras.get("epg_hours", DEFAULT_EPG_HOURS))
+        except ValueError:
+            errors.append(f"line {lineno}: epg_hours must be a number of hours")
+            continue
+        if epg_hours < 1:
+            errors.append(f"line {lineno}: epg_hours must be at least 1")
+            continue
+
         def resolve(key: str, fallback: str) -> Tuple[str, bool]:
             """This portal's value, else the built-in default.
 
@@ -443,12 +676,8 @@ def parse_portals(text: str) -> Tuple[List[PortalConfig], List[str]]:
             timezone=timezone,
             signature=signature,
             max_streams=max_streams,
-            # Absence of credentials selects device-ID auth, exactly as
-            # stalkerhek does (`deviceIdAuth := pd.Username == "" &&
-            # pd.Password == ""` in webui/profiles.go). The default ffff...
-            # IDs are what a MAC-only portal expects, so this fires even when
-            # the user supplied no IDs of their own.
-            device_id_auth=not (username and password),
+            epg=epg,
+            epg_hours=epg_hours,
         )
         portals.append(cfg)
 
@@ -470,6 +699,8 @@ def format_portal_line(
     password: str = "",
     max_streams: int = 1,
     stb: Optional[Dict[str, str]] = None,
+    epg: bool = False,
+    epg_hours: int = DEFAULT_EPG_HOURS,
 ) -> str:
     """Render one canonical line for the Portals setting.
 
@@ -493,6 +724,12 @@ def format_portal_line(
     # seeing on lines they never wrote themselves.
     if int(max_streams) != 1:
         extras.append(f"max_streams={int(max_streams)}")
+    if epg:
+        extras.append("epg=1")
+        # Same rule as max_streams: only written when it says something the
+        # default does not already say.
+        if int(epg_hours) != DEFAULT_EPG_HOURS:
+            extras.append(f"epg_hours={int(epg_hours)}")
 
     for key in STB_KEYS:
         value = (stb or {}).get(key, "").strip()
@@ -533,6 +770,41 @@ def normalize_portal_url(url: str) -> str:
         path = path.rstrip("/") + "/portal.php"
 
     return parsed._replace(path=path).geturl()
+
+
+def alternate_endpoint(url: str) -> str:
+    """The other place a Stalker API lives, or '' when there isn't one.
+
+    Ministra answers on two paths and installs differ in which they expose:
+    ``<base>/c/portal.php``, which is what :func:`normalize_portal_url` builds
+    and what most providers hand out, and ``<base>/server/load.php``, which is
+    the older canonical one and the only one pvr.stalker has ever asked for.
+    A portal serving just one of them used to be unusable if the user had been
+    given the other, with a 404 and nothing to suggest.
+
+    The mapping is pvr.stalker's, read backwards as well as forwards::
+
+        http://h/c/portal.php                -> http://h/server/load.php
+        http://h/stalker_portal/c/portal.php -> http://h/stalker_portal/server/load.php
+        http://h/server/load.php             -> http://h/c/portal.php
+    """
+    parsed = urlparse(url)
+    path = parsed.path
+    directory, _, filename = path.rpartition("/")
+    filename = filename.lower()
+
+    if filename == "portal.php":
+        base = directory[:-2] if directory.lower().endswith("/c") else directory
+        new_path = base + "/server/load.php"
+    elif filename == "load.php":
+        base = directory[:-7] if directory.lower().endswith("/server") else directory
+        new_path = base + "/c/portal.php"
+    else:
+        return ""
+
+    if new_path == path:
+        return ""
+    return parsed._replace(path=new_path).geturl()
 
 
 # ---------------------------------------------------------------------------
@@ -747,6 +1019,60 @@ def claim_sync_lock(token: str, ttl: int = 1800, client=None) -> Optional[bool]:
         return None
 
 
+def _auto_sync_key() -> str:
+    return f"{REDIS_PREFIX}:auto_sync"
+
+
+def claim_auto_sync(ttl: int = 1800, client=None) -> bool:
+    """Claim the right to start a sync from a scheduled refresh.
+
+    Load-bearing rather than defensive. A scheduled sync ends by asking
+    Dispatcharr to re-read the playlist it just wrote, and that re-read emits
+    the very event that started it -- so without a cooldown the two would take
+    turns forever, each round costing a login and a full channel download on a
+    MAC most providers allow one connection for.
+
+    The TTL is what breaks the ring: it has to outlast a sync, which on a large
+    portal with a guide is minutes, so the schedule cannot usefully be finer
+    than an hour either way.
+
+    Returns True when the caller may proceed. Redis being unreachable answers
+    False -- the opposite of :func:`claim_sync_lock`, and deliberately: that one
+    protects a button the user just pressed and should not refuse on a cache
+    outage, this one protects against a loop that nobody asked for.
+    """
+    client = _client_or_none(client)
+    if client is None:
+        return False
+    try:
+        return bool(client.set(_auto_sync_key(), "1", nx=True, ex=max(60, int(ttl))))
+    except Exception:
+        return False
+
+
+def hold_auto_sync(ttl: int = 1800, client=None) -> None:
+    """Mute the scheduled path for a while, without asking permission.
+
+    Claimed by any sync that ends by asking Dispatcharr to re-read a playlist,
+    because that re-read emits the event the schedule listens for -- and a sync
+    the user started by hand would otherwise come back as an echo and set off a
+    full re-fetch of every portal. Observed: adding one portal, and the echo
+    arriving two seconds later.
+
+    A plain write rather than :func:`claim_auto_sync`'s NX, since the point is
+    to push the window forward whether or not one is already open. The cost is
+    that a manual sync delays the next scheduled one, which is the right
+    trade -- everything was just fetched.
+    """
+    client = _client_or_none(client)
+    if client is None:
+        return
+    try:
+        client.set(_auto_sync_key(), "1", ex=max(60, int(ttl)))
+    except Exception:
+        pass
+
+
 def release_sync_lock(token: str, client=None) -> None:
     """Release the lock, but only while it is still ours.
 
@@ -902,6 +1228,21 @@ class ChannelEntry:
     logo: str = ""
     genre_id: str = ""
     number: str = ""
+    # Catch-up, as the portal advertises it. Read but not yet published:
+    # Dispatcharr does pick these up from an M3U -- it turns 'tv_archive' and
+    # 'tv_archive_duration' attributes into a stream's is_catchup and
+    # catchup_days -- but playing one back is Xtream-only, built from a
+    # server URL and credentials this plugin's sources do not have
+    # (apps/timeshift/helpers.py). Emitting them would light up a catch-up
+    # badge on channels whose catch-up cannot play, which is worse than not
+    # offering it. Captured here so the day that path stops being
+    # Xtream-shaped, the data is already arriving.
+    tv_archive: bool = False
+    tv_archive_duration: str = ""
+    # Whether the portal's own command had to be rebuilt into a marker -- see
+    # canonical_cmd. Counted rather than logged per channel, because on the
+    # portal that prompted it, 647 of them arrived at once.
+    cmd_rewritten: bool = False
 
 
 class Portal:
@@ -912,15 +1253,45 @@ class Portal:
     and skip the handshake.
     """
 
-    def __init__(self, cfg: PortalConfig, token: str = "", timeout: Optional[int] = None):
+    def __init__(
+        self,
+        cfg: PortalConfig,
+        token: str = "",
+        timeout: Optional[int] = None,
+        retries: int = 0,
+    ):
         self.cfg = cfg
+        # Where the API is asked, which starts as the configured URL and may be
+        # swapped once by login() for the portal's other endpoint. Kept apart
+        # from cfg.url on purpose: that one is still what logos are resolved
+        # against, and swapping the API path must not move them.
+        self.url = cfg.url
         self.token = token
         # The portal's own setting unless a caller insists, so every request
         # made about a portal honours what the user configured for it.
         self.timeout = timeout or getattr(cfg, "timeout", None) or DEFAULT_TIMEOUT
+        # Retrying is the caller's decision, not this class's, and it defaults
+        # to off because the caller that matters most must not have it. At tune
+        # time a portal that is not answering has to fail *now*: the resolver's
+        # only job on a bad source is to exit non-zero fast enough that
+        # Dispatcharr moves to the next one -- the same reasoning that keeps
+        # ffmpeg's -reconnect out of the default arguments. A sync has the
+        # opposite need, and asks for retries explicitly.
+        self.retries = max(0, int(retries))
         self.session = requests.Session()
         # Non-fatal notes from login(), for the caller to surface.
         self.warnings: List[str] = []
+        # Whether the portal said the token it handed back is already good for
+        # more than the handshake. Reported straight back to it in get_profile.
+        self.valid_token = False
+        # What get_profile answered during login(), kept so nothing has to ask
+        # twice: the expiry report and the blocked flag both read it.
+        self.profile: Dict[str, Any] = {}
+        # Which flow login() ended up taking, for the "Test portals" report.
+        # Worth saying out loud: it is the portal's choice, not the user's, so
+        # it is the one thing that tells them whether the credentials they
+        # typed in are being used at all.
+        self.auth_method = "handshake only"
 
     # -- plumbing ---------------------------------------------------------
 
@@ -949,27 +1320,82 @@ class Portal:
             headers["Authorization"] = "Bearer " + self.token
         return headers
 
+    def _common_params(self, with_auth: bool = True) -> str:
+        """Identity repeated in the query string, beside the cookie and header.
+
+        Belt and braces, and cheap. The MAC travels in a cookie and the token in
+        an Authorization header because that is what a MAG box does and what
+        Ministra reads -- but plenty of what this plugin meets are not Ministra,
+        and open-tv authenticates against real portals using *only* these two
+        query parameters, with no cookie and no header at all. Sending both
+        forms covers portals that read either, and no portal has been seen to
+        mind the one it ignores.
+        """
+        params = f"mac={quote(self.cfg.mac)}"
+        if with_auth and self.token:
+            params += f"&token={quote(self.token)}"
+        return params
+
+    def _request(self, method: str, url: str, **kwargs) -> requests.Response:
+        """One portal request, repeated only while repeating it could help.
+
+        Returns the response for the caller to interpret, including a final
+        failing one: deciding what an HTTP 404 means is :meth:`_get_json`'s job,
+        not this one's. Only exhausting the attempts without ever getting an
+        answer raises here.
+        """
+        last_error = ""
+        for attempt in range(self.retries + 1):
+            if attempt:
+                time.sleep(RETRY_BACKOFF[min(attempt, len(RETRY_BACKOFF)) - 1])
+            try:
+                resp = self.session.request(
+                    method, url, timeout=self.timeout, **kwargs
+                )
+            except requests.RequestException as exc:
+                last_error = f"request to portal failed: {exc}"
+                continue
+            if resp.status_code in RETRYABLE_STATUS and attempt < self.retries:
+                last_error = f"portal returned HTTP {resp.status_code}"
+                continue
+            return resp
+
+        raise PortalError(last_error or "request to portal failed")
+
     def _get_json(self, query: str, with_auth: bool = True) -> Any:
-        url = f"{self.cfg.url}?{query}"
-        try:
-            resp = self.session.get(
-                url, headers=self._headers(with_auth), timeout=self.timeout
+        url = f"{self.url}?{query}&{self._common_params(with_auth)}"
+        resp = self._request("GET", url, headers=self._headers(with_auth))
+
+        if resp.status_code in (401, 403):
+            raise PortalAuthError(
+                f"portal refused the session (HTTP {resp.status_code})"
             )
-        except requests.RequestException as exc:
-            raise PortalError(f"request to portal failed: {exc}") from exc
 
         if resp.status_code < 200 or resp.status_code >= 300:
             snippet = (resp.text or "").strip()[:300]
-            raise PortalError(
-                f"portal returned HTTP {resp.status_code}"
-                + (f": {snippet}" if snippet else "")
+            message = f"portal returned HTTP {resp.status_code}" + (
+                f": {snippet}" if snippet else ""
             )
+            # A 404 is a web server saying nothing lives at this path -- which
+            # is a statement about the path, not about the portal, and login()
+            # has somewhere else to look.
+            if resp.status_code == 404:
+                raise PortalEndpointError(message)
+            raise PortalError(message)
 
         try:
             return resp.json()
         except ValueError:
             snippet = (resp.text or "").strip()[:300]
-            raise PortalError(f"portal returned non-JSON response: {snippet}")
+            # A dead session is answered in plain text with a 200 attached, so
+            # it arrives here rather than as an HTTP error. Saying so is what
+            # lets the resolver re-authenticate instead of failing the tune.
+            if snippet.lower() == AUTH_FAILED_BODY:
+                raise PortalAuthError("portal says the session is no longer authorised")
+            # Anything else that is not JSON is an HTML error page, a login
+            # form, or a landing page: something is listening, but it is not a
+            # Stalker API, so the other endpoint is worth a try.
+            raise PortalEndpointError(f"portal returned non-JSON response: {snippet}")
 
     # -- authentication ---------------------------------------------------
 
@@ -982,12 +1408,22 @@ class Portal:
         js = data.get("js") if isinstance(data, dict) else None
         if isinstance(js, dict) and js.get("token"):
             self.token = str(js["token"])
+            # 'not_valid' is the portal saying the token still has to be
+            # earned. get_profile is told the same thing back, which is how it
+            # knows whether it is being asked to validate or merely to report.
+            self.valid_token = str(js.get("not_valid") or "0") in ("0", "")
         if not self.token:
             raise PortalError("handshake did not yield a token")
         return self.token
 
     def authenticate(self) -> None:
-        """Associate credentials with the token (username/password portals)."""
+        """Associate credentials with the token. Run when the profile says 2.
+
+        Sent as a POST, where every other call here is a GET: pvr.stalker puts
+        the login and password in the query string, and there is no reason for
+        this plugin to write a subscriber's password into a proxy's access log
+        when the portal accepts a form body just as happily.
+        """
         form = {
             "type": "stb",
             "action": "do_auth",
@@ -999,72 +1435,200 @@ class Portal:
         }
         headers = self._headers()
         headers["Content-Type"] = "application/x-www-form-urlencoded"
+        url = f"{self.url}?{self._common_params()}"
+        resp = self._request("POST", url, data=form, headers=headers)
+
         try:
-            resp = self.session.post(
-                self.cfg.url, data=form, headers=headers, timeout=self.timeout
-            )
             payload = resp.json()
-        except requests.RequestException as exc:
-            raise PortalError(f"authentication request failed: {exc}") from exc
         except ValueError:
             raise PortalError("authentication returned a non-JSON response")
 
         if not payload.get("js"):
-            raise PortalError(payload.get("text") or "invalid credentials")
+            # The portal read the credentials and said no. Not retryable, and
+            # not the same failure as never having reached it.
+            raise PortalAuthError(payload.get("text") or "invalid credentials")
 
-    def authenticate_with_device_ids(self) -> None:
-        """Second-step auth for portals keyed on device IDs rather than login."""
-        data = self._get_json(
-            "type=stb&action=get_profile&JsHttpRequest=1-xml&hd=1"
-            f"&sn={self.cfg.serial_number}&stb_type={self.cfg.model}"
-            f"&device_id={self.cfg.device_id}&device_id2={self.cfg.device_id2}"
-            "&auth_second_step=1"
+    def get_profile(self, auth_second_step: bool = False) -> Dict[str, Any]:
+        """Present the box to the portal and read back what it makes of it.
+
+        This is the request that carries the whole STB identity, and the reply
+        is the portal stating what it wants next -- see :meth:`login`. The
+        field list is libstalkerclient's, unchanged: portals have been known to
+        reject a profile that arrives with fields missing, and the cost of
+        sending all of them is a longer query string.
+        """
+        query = (
+            "type=stb&action=get_profile&JsHttpRequest=1-xml"
+            f"&hd=1&num_banks={STB_NUM_BANKS}"
+            f"&image_version={STB_IMAGE_VERSION}&hw_version={quote(STB_HW_VERSION)}"
+            f"&ver={quote(STB_VERSION)}"
+            f"&stb_type={quote(self.cfg.model)}&sn={quote(self.cfg.serial_number)}"
+            f"&device_id={quote(self.cfg.device_id)}"
+            f"&device_id2={quote(self.cfg.device_id2)}"
+            f"&signature={quote(self.cfg.signature)}"
+            f"&not_valid_token={0 if self.valid_token else 1}"
+            f"&auth_second_step={1 if auth_second_step else 0}"
         )
+        data = self._get_json(query)
         js = data.get("js") if isinstance(data, dict) else None
-        if not isinstance(js, dict) or not js.get("id"):
-            raise PortalError(
-                (data or {}).get("text") or "device ID authentication rejected"
-            )
+        return js if isinstance(js, dict) else {}
+
+    # What get_profile's 'status' means. The portal decides which authentication
+    # this account needs and says so here, rather than the client guessing from
+    # whether a password happens to be configured.
+    _PROFILE_OK = 0
+    _PROFILE_NEEDS_AUTH = 2
 
     def login(self) -> str:
-        """Handshake plus whichever auth flow this portal needs.
+        """Handshake, then whichever authentication the portal asks for.
 
-        Credentials win when present. Otherwise the device-ID step runs, which
-        is what stalkerhek does for MAC-only portals -- but its failure is not
-        fatal here: plenty of portals authorise purely on the MAC cookie and
-        either lack ``get_profile`` or answer it without a profile id. If the
-        session really is unauthorised, the very next call fails with a far
-        more useful message than "device ID authentication rejected".
+        The portal is the one that knows::
+
+            handshake  ->  token (+ 'not_valid': is it good for anything yet?)
+            get_profile
+                status 0  ->  done
+                status 2  ->  do_auth, then get_profile(auth_second_step=1)
+                anything  ->  refused; 'block_msg'/'msg' says why
+
+        This replaces guessing the flow from whether credentials were typed in.
+        The old guess was wrong in both directions -- it ran a device-ID step
+        against portals that wanted a password, and it had no way to tell a
+        blocked account from an empty line-up.
+
+        Two deliberate departures from that state machine, both of them
+        tolerance for portals that are not really Ministra:
+
+        * a reply with no ``status`` at all counts as 0. Ministra always sends
+          one; the clones this plugin mostly meets often do not, and the
+          previous version happily served them. pvr.stalker treats the same
+          silence as a failure, which would break every one of those installs.
+        * ``get_profile`` failing to answer *at all* -- 404, a gateway error,
+          prose instead of JSON -- is a warning, not an error. Plenty of
+          portals authorise on the MAC cookie alone and never implement it. An
+          explicit refusal (:class:`PortalAuthError`) is still fatal, because
+          that is the portal answering rather than failing to.
         """
-        self.handshake()
+        self._handshake_on_either_endpoint()
 
-        if self.cfg.username and self.cfg.password:
-            self.authenticate()
-        elif self.cfg.device_id_auth:
-            try:
-                self.authenticate_with_device_ids()
-            except PortalError as exc:
-                self.warnings.append(
-                    f"device-ID authentication did not succeed ({exc}); "
-                    "continuing with MAC-only authorisation"
+        try:
+            self.profile = self.get_profile()
+        except PortalAuthError:
+            raise
+        except PortalError as exc:
+            self.warnings.append(
+                f"the portal did not answer get_profile ({exc}); "
+                "continuing with MAC-only authorisation"
+            )
+            return self.token
+
+        status = self._profile_status(self.profile)
+        self.auth_method = "profile"
+
+        if status == self._PROFILE_NEEDS_AUTH:
+            if not (self.cfg.username and self.cfg.password):
+                raise PortalAuthError(
+                    self._profile_message(self.profile)
+                    or "this portal wants a username and password; add "
+                    "'username=... password=...' to its line"
                 )
+            self.authenticate()
+            self.profile = self.get_profile(auth_second_step=True)
+            status = self._profile_status(self.profile)
+            self.auth_method = "credentials"
+
+        if status != self._PROFILE_OK:
+            raise PortalAuthError(
+                self._profile_message(self.profile)
+                or f"portal refused the session (status {status})"
+            )
 
         return self.token
+
+    def _handshake_on_either_endpoint(self) -> None:
+        """Shake hands, trying the portal's other API path if this one is not it.
+
+        The handshake is every session's first request, so a portal reached at
+        the wrong path fails here and nowhere later -- which makes this the one
+        place worth spending an extra round-trip on.
+
+        Only a :class:`PortalEndpointError` earns that second try: a 404, or an
+        answer that is not JSON. A portal that is unreachable, unwell or
+        refusing the MAC would answer identically on both paths, and at tune
+        time a wasted round-trip is time Dispatcharr is not yet spending on the
+        next source.
+
+        The swap lasts for this session only. Nothing is written back, so the
+        cost is one failed request per sync and per token expiry -- small, and
+        the warning tells the user how to stop paying it for good.
+        """
+        try:
+            self.handshake()
+            return
+        except PortalEndpointError as exc:
+            alternate = alternate_endpoint(self.url)
+            if not alternate:
+                raise
+            first_failure = exc
+
+        self.url = alternate
+        try:
+            self.handshake()
+        except PortalError:
+            # The other path is no better. Report the original failure: it is
+            # the one about the URL the user actually configured.
+            self.url = self.cfg.url
+            raise first_failure
+
+        self.warnings.append(
+            f"the portal does not answer at {self.cfg.url} ({first_failure}), "
+            f"but does at {alternate}; put that on its portal line to save a "
+            "failed request on every sync"
+        )
+
+    @staticmethod
+    def _profile_status(profile: Dict[str, Any]) -> int:
+        """``status`` as an int. Absent, blank or unparseable all mean OK."""
+        raw = profile.get("status")
+        if raw is None or raw == "":
+            return Portal._PROFILE_OK
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            return Portal._PROFILE_OK
+
+    @staticmethod
+    def _profile_message(profile: Dict[str, Any]) -> str:
+        """The portal's own explanation, if it gave one.
+
+        ``block_msg`` first: when both are set it is the specific one, and it
+        is what the reseller wrote for exactly this situation.
+        """
+        for key in ("block_msg", "msg"):
+            value = str(profile.get(key) or "").strip()
+            if value:
+                return value
+        return ""
 
     def account_snapshot(self) -> Dict[str, Any]:
         """What the portal will say about the subscription itself.
 
-        Two calls, both made once per sync and never at tune time. Neither is
-        required for anything to work, so this returns what it managed to read
-        and never raises.
+        One call, made once per sync and never at tune time. Not required for
+        anything to work, so this returns what it managed to read and never
+        raises.
 
         ``get_main_info`` is where resellers put the expiry date: Ministra shows
         the ``phone`` field in the MAG interface, so that is the field they fill
         in with it -- observed on every portal tested, in the form
-        "August 18, 2027, 4:53 pm". ``get_profile`` carries ``blocked``, which
-        turns "nothing plays and I do not know why" into one line of the report.
+        "August 18, 2027, 4:53 pm".
 
-        No connection limit is available from either: neither ``max_online`` nor
+        ``blocked`` comes from the profile :meth:`login` already read, rather
+        than from a second ``get_profile``. It is nearly always redundant now --
+        a blocked account normally answers with a non-zero ``status``, which
+        login refuses outright -- but portals that set the flag and leave the
+        status at 0 exist, and for those it is still the only warning anyone
+        gets.
+
+        No connection limit is available anywhere: neither ``max_online`` nor
         an equivalent exists in the responses, and ``playback_limit`` is a
         portal-wide Ministra default (3 on unrelated providers, next to
         ``tv_playback_retry_limit`` = 3), not this account's allowance. Guessing
@@ -1081,23 +1645,18 @@ class Portal:
         except Exception:
             pass
 
-        try:
-            js = self._get_json(
-                "type=stb&action=get_profile&hd=1&JsHttpRequest=1-xml"
-            ).get("js")
-            if isinstance(js, dict):
-                snapshot["blocked"] = str(js.get("blocked") or "0") not in ("0", "")
-        except Exception:
-            pass
+        snapshot["blocked"] = str(self.profile.get("blocked") or "0") not in ("0", "")
 
         return snapshot
 
-    def watchdog(self) -> None:
-        """Keep-alive ping. Only needed by portals that drop idle sessions."""
-        self._get_json(
-            "action=get_events&event_active_id=0&init=0&type=watchdog"
-            "&cur_play_type=1&JsHttpRequest=1-xml"
-        )
+    # There is no watchdog here, and its absence is a decision rather than an
+    # omission. Stalker clients keep a session warm by calling get_events every
+    # 'timeslot' seconds, which needs something alive between requests to do the
+    # calling. This plugin has no such thing: the sync is a task that ends, and
+    # the resolver is a process that becomes ffmpeg. A ping method existed for
+    # two releases with no caller, which is worse than not having one -- it read
+    # as a feature. Sessions are re-established instead, which is what the token
+    # cache and the resolver's re-authentication are for.
 
     # -- content ----------------------------------------------------------
 
@@ -1130,23 +1689,244 @@ class Portal:
 
         channels: List[ChannelEntry] = []
         for row in rows:
-            if not isinstance(row, dict):
-                continue
-            cmd = str(row.get("cmd") or "").strip()
-            name = str(row.get("name") or "").strip()
-            if not cmd or not name:
-                continue
-            channels.append(
-                ChannelEntry(
-                    channel_id=str(row.get("id") or ""),
-                    name=name,
-                    cmd=cmd,
-                    logo=str(row.get("logo") or ""),
-                    genre_id=str(row.get("tv_genre_id") or ""),
-                    number=str(row.get("number") or ""),
-                )
-            )
+            channel = self._channel_from_row(row)
+            if channel is not None:
+                channels.append(channel)
         return channels
+
+    @staticmethod
+    def _channel_from_row(row: Any) -> Optional[ChannelEntry]:
+        """One row of a channel listing, or None when it is not usable.
+
+        A row without a name or without a command is not a channel this plugin
+        can do anything with, and portals do emit them.
+        """
+        if not isinstance(row, dict):
+            return None
+        cmd = str(row.get("cmd") or "").strip()
+        name = str(row.get("name") or "").strip()
+        if not cmd or not name:
+            return None
+
+        channel_id = str(row.get("id") or "")
+        marker = canonical_cmd(cmd, channel_id)
+
+        return ChannelEntry(
+            channel_id=channel_id,
+            name=name,
+            cmd=marker,
+            cmd_rewritten=marker != cmd,
+            logo=str(row.get("logo") or ""),
+            genre_id=str(row.get("tv_genre_id") or ""),
+            number=str(row.get("number") or ""),
+            # Portals write these as 1/0, and sometimes as "1"/"0".
+            tv_archive=str(row.get("enable_tv_archive") or "0") not in ("0", ""),
+            tv_archive_duration=str(row.get("tv_archive_duration") or ""),
+        )
+
+    def get_ordered_list(self, page: int) -> Dict[str, Any]:
+        """One page of the paginated listing, as the MAG interface browses it.
+
+        ``genre=*`` is every genre, which is what the box asks for on its "All"
+        screen. pvr.stalker leaves it out -- its request builder drops any
+        optional parameter still equal to its own default, and its default is
+        ``*`` -- but sending it says the same thing to portals that have no
+        such default to fall back on.
+        """
+        data = self._get_json(
+            "type=itv&action=get_ordered_list&JsHttpRequest=1-xml"
+            f"&genre=*&fav=0&sortby=number&p={int(page)}"
+        )
+        js = data.get("js") if isinstance(data, dict) else None
+        return js if isinstance(js, dict) else {}
+
+    def list_channels(self, progress=None) -> List[ChannelEntry]:
+        """Every channel, however this portal is willing to hand them over.
+
+        ``get_all_channels`` first, because one request for the whole line-up is
+        what nearly every portal supports and is enormously cheaper. Portals
+        that cap it, or never implemented it, answer with an error or with
+        nothing -- and used to leave the portal unusable. For those, the listing
+        is collected a page at a time instead: hundreds of requests where there
+        was one, several minutes where there were seconds, and worth every bit
+        of it because the alternative is a portal that cannot be synced at all.
+
+        ``progress`` is called with a line of English whenever there is
+        something worth saying, so a sync that has gone quiet for four minutes
+        can account for itself. Passed as a callback rather than a logger to
+        keep this module free of anything Django-shaped.
+
+        A portal that refuses the session is not asked twice: paging would be
+        refused for exactly the same reason, and the second refusal is the one
+        that would get a MAC noticed.
+        """
+        try:
+            return self.get_all_channels()
+        except PortalAuthError:
+            raise
+        except PortalError as exc:
+            single_shot_failure = exc
+
+        if progress:
+            progress(
+                f"the portal would not list its channels in one request "
+                f"({single_shot_failure}); collecting them a page at a time"
+            )
+
+        channels = self._paged_channels(progress)
+        if not channels:
+            # Nothing worked, so the first failure is the one worth reporting:
+            # it is the one whose message names the likely cause.
+            raise single_shot_failure
+
+        if progress:
+            progress(f"collected {len(channels)} channels by paging")
+        return channels
+
+    def _paged_channels(self, progress=None) -> List[ChannelEntry]:
+        """Walk get_ordered_list until one of three things says to stop.
+
+        All three are needed, because each covers a portal the others do not:
+
+        * the page count the portal itself implies, from ``total_items`` and
+          ``max_page_items`` on the first page. The bound pvr.stalker uses, and
+          the only one that stops at exactly the right place.
+        * a page with no rows. What a well-behaved portal does past the end,
+          and open-tv's only guard.
+        * a page whose rows have all been seen already. Portals that clamp ``p``
+          to their last page answer forever otherwise, which is the case that
+          turns open-tv's loop into an infinite one.
+        """
+        channels: List[ChannelEntry] = []
+        seen = set()
+        max_pages = ORDERED_LIST_PAGE_CAP
+        page = 1
+
+        while page <= max_pages:
+            js = self.get_ordered_list(page)
+            rows = js.get("data")
+            if not isinstance(rows, list) or not rows:
+                break
+
+            if page == 1:
+                implied = self._page_count(js)
+                if implied:
+                    max_pages = min(max_pages, implied)
+                    if progress:
+                        progress(f"the portal reports {implied} pages to read")
+
+            fresh = 0
+            for row in rows:
+                channel = self._channel_from_row(row)
+                if channel is None:
+                    continue
+                # The id when there is one, the command when there is not: two
+                # channels never share a command, and a portal that omits ids
+                # would otherwise collapse its whole line-up into one entry.
+                key = channel.channel_id or channel.cmd
+                if key in seen:
+                    continue
+                seen.add(key)
+                channels.append(channel)
+                fresh += 1
+
+            if not fresh:
+                break
+
+            if progress and page % 20 == 0:
+                progress(f"page {page}, {len(channels)} channels so far")
+            page += 1
+
+        return channels
+
+    @staticmethod
+    def _page_count(js: Dict[str, Any]) -> int:
+        """How many pages the portal implies, or 0 when it does not say."""
+        total = as_int(js.get("total_items"))
+        per_page = as_int(js.get("max_page_items"))
+        if total > 0 and per_page > 0:
+            return (total + per_page - 1) // per_page
+        return 0
+
+    def get_epg_info(self, hours: int, scratch_dir: Optional[str] = None) -> Dict[str, Any]:
+        """The whole line-up's guide, keyed by the portal's channel id.
+
+        Deliberately not routed through :meth:`_get_json`, which is built for
+        replies that fit in a breath. This one does not: a portal with 13,000
+        channels answers a single day with something in the order of 100 MB,
+        and ``_get_json`` would hold the encoded bytes and the decoded object
+        at the same time.
+
+        So the reply is streamed to a scratch file first. That does not make
+        the parse cheaper -- the decoded structure is what it is -- but it does
+        two things worth the detour: nothing is decoded until the size is known,
+        so an absurd answer is refused instead of discovered by having the
+        worker killed; and requests never has to buffer the whole body.
+
+        Returns ``{channel_id: [programme, ...]}``, empty when the portal has
+        no guide to give. Never returns None, so a caller can iterate it.
+        """
+        query = (
+            "type=itv&action=get_epg_info&JsHttpRequest=1-xml"
+            f"&period={int(hours)}"
+        )
+        url = f"{self.url}?{query}&{self._common_params()}"
+        resp = self._request("GET", url, headers=self._headers(), stream=True)
+
+        if resp.status_code in (401, 403):
+            raise PortalAuthError(
+                f"portal refused the guide (HTTP {resp.status_code})"
+            )
+        if resp.status_code < 200 or resp.status_code >= 300:
+            raise PortalError(f"portal returned HTTP {resp.status_code} for the guide")
+
+        with tempfile.TemporaryFile(dir=scratch_dir) as scratch:
+            size = 0
+            for chunk in resp.iter_content(chunk_size=1024 * 256):
+                if not chunk:
+                    continue
+                size += len(chunk)
+                if size > EPG_MAX_BYTES:
+                    resp.close()
+                    raise PortalError(
+                        f"the guide is larger than {EPG_MAX_BYTES // (1024 * 1024)} MB "
+                        f"and was abandoned; ask for fewer hours than {int(hours)} "
+                        "with 'epg_hours=' on the portal line"
+                    )
+                scratch.write(chunk)
+
+            scratch.seek(0)
+            try:
+                data = json.load(scratch)
+            except ValueError:
+                raise PortalError("the guide was not JSON")
+
+        js = data.get("js") if isinstance(data, dict) else None
+        if not isinstance(js, dict):
+            raise PortalError(
+                f"the guide came back as {type(js).__name__} rather than an object"
+            )
+
+        rows = js.get("data")
+        if isinstance(rows, dict):
+            return rows
+
+        # An empty list is how a portal says it has no full guide -- observed on
+        # several, always as `{"js": {"data": []}}`. Not an error: plenty of
+        # portals carry a channel list and no programmes for it, or serve a
+        # guide one channel at a time, which is a different action and not one
+        # this uses.
+        if rows is None or (isinstance(rows, list) and not rows):
+            return {}
+
+        # Anything else is a shape nobody has met yet, and silently treating it
+        # as "no guide" is how it would stay unmet. A flat list of programmes,
+        # say, would be perfectly usable if someone knew it was arriving.
+        raise PortalError(
+            f"the guide arrived as {type(rows).__name__} with "
+            f"{len(rows) if hasattr(rows, '__len__') else '?'} entries, which "
+            "is not a shape this understands -- please report it"
+        )
 
     def create_link(self, cmd: str) -> str:
         """Ask the portal for a playable URL for ``cmd``.
@@ -1155,28 +1935,69 @@ class Portal:
         ``"ffmpeg http://host/stream.m3u8?token=..."`` -- so :func:`extract_link`
         finds the playable part. These links are short-lived, which is why this
         is called at tune time rather than sync time.
+
+        The channel is named twice where it can be: in the command, and in a
+        ``stream`` parameter beside it. Ministra reads the command and ignores
+        the rest; the portals that do not answer about no channel at all
+        without it -- see :func:`stream_id`. Only ever sent with a value, so a
+        portal that never asked for it sees the request it has always seen.
         """
-        data = self._get_json(
-            f"action=create_link&type=itv&cmd={quote(cmd, safe='')}&JsHttpRequest=1-xml"
-        )
+        query = f"action=create_link&type=itv&cmd={quote(cmd, safe='')}"
+        channel = stream_id(cmd)
+        if channel:
+            query += f"&stream={quote(channel, safe='')}"
+
+        data = self._get_json(f"{query}&JsHttpRequest=1-xml")
         js = data.get("js") if isinstance(data, dict) else None
+        # Typed as auth failures, both of them, because that is overwhelmingly
+        # what they are: a portal whose token has expired usually answers
+        # create_link with a hollow success -- 'js' false, or a 'cmd' that is
+        # empty -- rather than with the plain-text refusal. The resolver only
+        # re-authenticates on this class, so mistyping these would leave the
+        # cached-token path unable to recover from the very thing it exists
+        # for. The cost of being wrong is one handshake.
         if not isinstance(js, dict):
-            raise PortalError("create_link returned no data (session may have expired)")
+            raise PortalAuthError(
+                "create_link returned no data (session may have expired)"
+            )
 
         raw = str(js.get("cmd") or "").strip()
         if not raw:
-            raise PortalError("create_link returned an empty command")
+            raise PortalAuthError("create_link returned an empty command")
 
         link = extract_link(raw)
         if not link:
             raise PortalError(f"create_link returned an unusable command: {raw[:200]}")
+
+        unglued = undoubled_link(cmd, link)
+        if unglued != link:
+            self.warnings.append(
+                f"the portal answered with its own base in front of a command "
+                f"that was already a link ({link[:160]}); that path does not "
+                "exist, so the command itself is what plays"
+            )
+            return unglued
         return link
 
     def logo_url(self, logo: str) -> str:
-        """Absolute URL for a channel logo, or '' when there isn't one."""
+        """Absolute URL for a channel logo, or '' when there isn't one.
+
+        Two shapes beyond the obvious, both from pvr.stalker's
+        ``DetermineLogoURI``, both seen in the wild:
+
+        * an inline ``data:`` image, which is dropped. It is a valid logo and a
+          useless one here -- Dispatcharr stores this in a URL field, and a
+          base64 payload has no business in an M3U attribute.
+        * any scheme at all, not just http(s). A portal serving its logos from
+          somewhere else says so with a scheme, and treating that as a filename
+          produced a URL that pointed nowhere.
+        """
+        logo = (logo or "").strip()
         if not logo:
             return ""
-        if logo.startswith(("http://", "https://")):
+        if logo[:5].lower() == "data:":
+            return ""
+        if "://" in logo:
             return logo
         parsed = urlparse(self.cfg.url)
         base_dir = parsed.path.rsplit("/", 1)[0] or ""

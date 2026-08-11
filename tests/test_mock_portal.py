@@ -32,14 +32,19 @@ class PortalHandler(BaseHTTPRequestHandler):
 
     def _handle(self, params, method):
         action = params.get("action", [""])[0]
-        seen_requests.append((method, action, dict(self.headers)))
+        seen_requests.append((method, action, dict(self.headers), params))
 
         if action == "handshake":
-            return self._reply({"js": {"token": "TESTTOKEN123", "not_valid": 0}})
+            return self._reply({"js": {"token": "TESTTOKEN123", "not_valid": 1}})
         if action == "do_auth":
             return self._reply({"js": True, "text": "authenticated"})
         if action == "get_profile":
-            return self._reply({"js": {"id": 42, "fname": "Test User"}})
+            # A portal that wants credentials: status 2 until do_auth has run
+            # and get_profile comes back with auth_second_step=1. This is the
+            # full state machine login() implements.
+            if params.get("auth_second_step", ["0"])[0] == "1":
+                return self._reply({"js": {"id": 42, "fname": "Test User", "status": 0}})
+            return self._reply({"js": {"status": 2, "msg": "authorization required"}})
         if action == "get_genres":
             return self._reply({"js": [
                 {"id": "1", "title": "FR| SPORT"},
@@ -47,9 +52,9 @@ class PortalHandler(BaseHTTPRequestHandler):
             ]})
         if action == "get_all_channels":
             return self._reply({"js": {"data": [
-                {"id": "101", "name": 'Canal+ "HD"', "cmd": "ffmpeg http://prov/ch/101",
-                 "logo": "canal.png", "tv_genre_id": "1", "number": "1"},
-                {"id": "102", "name": "BBC One", "cmd": "ffmpeg http://prov/ch/102",
+                {"id": "101", "name": 'Alpha "HD"', "cmd": "ffmpeg http://prov/ch/101",
+                 "logo": "alpha.png", "tv_genre_id": "1", "number": "1"},
+                {"id": "102", "name": "Beta One", "cmd": "ffmpeg http://prov/ch/102",
                  "logo": "", "tv_genre_id": "2", "number": "2"},
                 {"id": "103", "name": "No Genre", "cmd": "ffmpeg http://prov/ch/103",
                  "logo": "ng.png", "tv_genre_id": "99", "number": ""},
@@ -58,6 +63,16 @@ class PortalHandler(BaseHTTPRequestHandler):
             cmd = params.get("cmd", [""])[0]
             assert cmd.startswith("ffmpeg "), f"cmd not decoded properly: {cmd!r}"
             return self._reply({"js": {"cmd": "ffmpeg http://prov/live/101.m3u8?token=FRESH"}})
+        if action == "get_epg_info":
+            assert params.get("period") == ["24"], params
+            return self._reply({"js": {"data": {
+                "101": [{"id": "1", "name": "Evening Report", "descr": "News & more",
+                         "start_timestamp": 1785276000, "stop_timestamp": 1785279600}],
+                # A channel the playlist does not carry: the guide must not
+                # invent an entry for it.
+                "999": [{"id": "2", "name": "Ghost", "descr": "",
+                         "start_timestamp": 1785276000, "stop_timestamp": 1785279600}],
+            }}})
         if action == "get_events":
             return self._reply({"js": [], "text": ""})
         return self._reply({"js": []})
@@ -121,7 +136,7 @@ def main():
     print("\n--- generated M3U ---")
     print(m3u)
 
-    # The quote in 'Canal+ "HD"' must not break the attribute quoting.
+    # The quote in 'Alpha "HD"' must not break the attribute quoting.
     assert '"' not in m3u.split("\n")[1].split(",")[0].replace('tvg-id="', "").replace('"', "") or True
     for line in m3u.splitlines():
         if line.startswith("#EXTINF"):
@@ -129,7 +144,7 @@ def main():
     assert 'group-title="FR| SPORT"' in m3u
     assert 'group-title="Other"' in m3u, "unknown genre must fall back to Other"
     assert 'tvg-id="mock.101"' in m3u
-    assert "misc/logos/320/canal.png" in m3u
+    assert "misc/logos/320/alpha.png" in m3u
 
     # Round-trip a generated URL exactly as resolver.py would.
     pseudo = [l for l in m3u.splitlines() if l.startswith("http://distalker.invalid")][0]
@@ -138,12 +153,59 @@ def main():
     print("pseudo-URL round-trip through the playlist: OK")
 
     # Auth header must be present on content calls but absent on handshake.
-    by_action = {a: h for _, a, h in seen_requests}
+    by_action = {a: h for _, a, h, _ in seen_requests}
     assert "Authorization" not in by_action["handshake"], "handshake must not send a token"
     assert by_action["get_all_channels"]["Authorization"] == "Bearer TESTTOKEN123"
     assert "MAG200 stbapp" in by_action["get_all_channels"]["User-Agent"]
     assert "mac=00%3A1A%3A79%3AAA%3ABB%3ACC" in by_action["get_all_channels"]["Cookie"]
     print("headers (UA / Bearer / MAC cookie): OK")
+
+    # The identity reaches a real socket in both forms, not just in the
+    # headers a unit test can inspect.
+    content = [p for _, a, _, p in seen_requests if a == "get_all_channels"][0]
+    assert content["mac"] == ["00:1A:79:AA:BB:CC"], content
+    assert content["token"] == ["TESTTOKEN123"], content
+
+    # The portal asked for credentials and got them, in the right order.
+    actions = [a for _, a, _, _ in seen_requests]
+    assert actions[:4] == ["handshake", "get_profile", "do_auth", "get_profile"], actions
+    assert portal.auth_method == "credentials", portal.auth_method
+
+    profiles = [p for _, a, _, p in seen_requests if a == "get_profile"]
+    # not_valid=1 from the handshake must come back as not_valid_token=1.
+    assert profiles[0]["not_valid_token"] == ["1"], profiles[0]
+    assert profiles[0]["auth_second_step"] == ["0"], profiles[0]
+    assert profiles[1]["auth_second_step"] == ["1"], profiles[1]
+    # The whole STB identity travels with it, signature included -- it used to
+    # be a setting nothing ever sent.
+    assert profiles[0]["signature"] == [s.DEFAULT_SIGNATURE], profiles[0]
+    assert profiles[0]["stb_type"] == [s.DEFAULT_MODEL], profiles[0]
+    assert profiles[0]["sn"] == [s.DEFAULT_SERIAL], profiles[0]
+    assert profiles[0]["hw_version"] == [s.STB_HW_VERSION], profiles[0]
+    assert "PORTAL version: 4.9.9" in profiles[0]["ver"][0], profiles[0]
+    print("get_profile state machine (status 2 -> do_auth -> second step): OK")
+
+    # The guide, over a real socket: the streamed download and the scratch
+    # file are the parts a faked transport would never exercise.
+    epg_data = portal.get_epg_info(24)
+    assert set(epg_data) == {"101", "999"}, epg_data
+    guide = "".join(sync.build_xmltv(portal, channels, epg_data))
+    print("\n--- generated XMLTV ---")
+    print(guide)
+
+    import xml.etree.ElementTree as ET
+
+    root = ET.fromstring(guide)
+    ids = [c.get("id") for c in root.findall("channel")]
+    assert ids == ["mock.101"], ids
+    assert root.find("programme").get("channel") == "mock.101"
+    assert root.find("programme/title").text == "Evening Report"
+    assert root.find("programme/desc").text == "News & more"
+    assert root.find("programme").get("start") == "20260728220000 +0000"
+    # Every tvg-id in the guide must exist in the playlist it accompanies.
+    for cid in ids:
+        assert f'tvg-id="{cid}"' in m3u, cid
+    print("XMLTV round-trip and tvg-id agreement: OK")
 
     # ffmpeg argv construction, as resolver.py builds it.
     import resolver

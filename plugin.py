@@ -33,11 +33,13 @@ from .registry import (
     save_registry,
 )
 from .stalker_api import (
+    DEFAULT_EPG_HOURS,
     DEFAULT_FFMPEG_ARGS,
     DEFAULT_TIMEOUT,
     STB_KEYS,
     PortalConfig,
     PortalError,
+    claim_auto_sync,
     forget_portal,
     format_portal_line,
     is_superseded_ffmpeg_args,
@@ -50,11 +52,15 @@ from .stalker_api import (
 )
 
 from .sync import (
+    ACCOUNT_PREFIX,
+    TRIGGER_REPARSE_DELAY,
     announce,
+    apply_refresh_interval,
     apply_stream_profile,
     install_stream_profile,
     portal_status,
     publish_fallback,
+    request_reparse_later,
     sync_all,
     test_portal,
 )
@@ -69,6 +75,13 @@ LEGACY_STB_SETTINGS = {
     "stb_signature": "signature",
     "stb_timezone": "timezone",
 }
+
+# How long a scheduled sync blocks the next one. It has to outlast the sync it
+# guards, because that sync ends by asking Dispatcharr to re-read the playlist
+# it wrote -- which emits the event that started it. Thirty minutes is chosen
+# against a large portal with a guide, and is why the schedule cannot usefully
+# be finer than an hour.
+AUTO_SYNC_COOLDOWN = 1800
 
 _MANIFEST_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "plugin.json")
 
@@ -206,6 +219,13 @@ class Plugin:
                         extras.get("password", ""),
                         int(extras.get("max_streams", 1) or 1),
                         stb,
+                        # Carried through explicitly. This rewrite keeps only
+                        # what it is handed, so anything left out here is
+                        # silently deleted from the user's line.
+                        extras.get("epg", "").strip().lower()
+                        in ("1", "true", "yes", "on"),
+                        int(extras.get("epg_hours", DEFAULT_EPG_HOURS)
+                            or DEFAULT_EPG_HOURS),
                     )
                 )
                 changed += 1
@@ -484,8 +504,15 @@ class Plugin:
     # must not cost a download of everything the user already has.
     LINEUP_KEYS = (
         "url", "mac", "username", "password", "device_id", "device_id2",
-        "serial_number", "model", "timezone", "device_id_auth",
+        "serial_number", "model", "timezone", "signature",
     )
+
+    # Everything a change to which means the portal has to be asked again.
+    # The line-up keys, plus the guide: turning 'epg=1' on changes nothing
+    # about the channels, so without this the plan would call the portal
+    # unchanged, fetch nothing, and leave the user pressing Sync at a setting
+    # that appears to do nothing.
+    FETCH_KEYS = LINEUP_KEYS + ("epg", "epg_hours")
 
     def _plan(self, portals: List[PortalConfig]) -> Dict[str, Any]:
         """Sort the configured portals into what needs the network and what does not.
@@ -505,7 +532,7 @@ class Plugin:
             previous = load_portal(cfg.slug) if cfg.slug in published else None
             if previous is None:
                 plan["new"].append(cfg)
-            elif any(getattr(cfg, key) != getattr(previous, key) for key in self.LINEUP_KEYS):
+            elif any(getattr(cfg, key) != getattr(previous, key) for key in self.FETCH_KEYS):
                 plan["changed"].append(cfg)
             else:
                 plan["unchanged"].append(cfg)
@@ -546,19 +573,130 @@ class Plugin:
         return {"status": "ok", "message": "sync started: " + self._describe(plan)}
 
     def _action_resync_all(self, params, settings, logger) -> Dict[str, Any]:
-        """Re-fetch every portal, changed or not."""
+        """Re-fetch every portal, changed or not.
+
+        A button, and also the plugin's clock. It subscribes to ``m3u_refresh``
+        because that is the only periodic thing a plugin can be woken by:
+        Dispatcharr schedules a refresh per M3U account, and the event it ends
+        with reaches here -- see :meth:`_scheduled_run_wanted` for the three
+        things that have to be true before an event is allowed to act on it.
+
+        A full re-fetch rather than a planned one, deliberately. The plan
+        compares the portal list against what is published, and on a schedule
+        nothing in the list has changed -- so a planned run would find nothing
+        to do every single time, which is the opposite of a refresh.
+        """
+        if params.get("event"):
+            reason = self._scheduled_run_wanted(params, settings, logger)
+            if reason:
+                return {"status": "ok", "message": reason, "changed": False}
+
+            # Here, not in a thread. The event arrives inside a Celery task,
+            # where a daemon thread dies with the worker the moment the pool
+            # scales down -- see tasks.run_sync_here. Running it where we
+            # stand also means the report is the real one rather than a
+            # promise that something has started.
+            result = tasks.run_sync_here(full=True, logger=logger)
+            if result is None:
+                # Said out loud, because this is the one outcome that used to
+                # leave no trace at all: an event run that changes nothing is
+                # not recorded in the panel either, so a schedule refused by
+                # the lock looked exactly like a schedule that never fired.
+                logger.info(
+                    "distalker: the scheduled sync stood down -- another one "
+                    "holds the lock"
+                )
+                return {"status": "ok", "message": self._already_running(),
+                        "changed": False}
+
+            self._reparse_the_account_that_woke_us(params, logger)
+            return {"status": "ok", "message": result["message"], "changed": True}
+
         portals = self._portals(settings)
 
         if not tasks.run_sync_in_background(full=True):
-            return {"status": "ok", "message": self._already_running()}
+            return {"status": "ok", "message": self._already_running(), "changed": False}
 
         return {
             "status": "ok",
+            "changed": True,
             "message": (
                 f"re-fetching all {len(portals)} portal(s) in the background. Refresh "
                 "the Plugins page to read the result in Last action."
             ),
         }
+
+    def _reparse_the_account_that_woke_us(self, params, logger) -> None:
+        """Ask again for the one playlist the sync could not get re-read.
+
+        Here rather than in the sync, because it is the event path that knows
+        which account is the awkward one, and because by now the sync has
+        returned -- there is nothing left of our work for the lock to outlast.
+        See sync.request_reparse_later for what the lock is and why it refuses.
+        """
+        account = str((params.get("payload") or {}).get("account_name") or "")
+        try:
+            if request_reparse_later(account):
+                logger.info(
+                    "distalker: asking again in %ds for '%s' to be re-read -- "
+                    "its own refresh is what woke us, so it held the lock while "
+                    "we worked",
+                    TRIGGER_REPARSE_DELAY,
+                    account,
+                )
+        except Exception:
+            # Never worth failing a completed sync over: the playlist is
+            # written either way, and the next cycle reads it.
+            logger.debug(
+                "distalker: could not re-ask for '%s'", account, exc_info=True
+            )
+
+    def _scheduled_run_wanted(self, params, settings, logger) -> str:
+        """Why this event should be ignored, or '' to let it through.
+
+        Three guards, each covering something different:
+
+        * the setting. ``refresh_hours`` at 0 means the user never asked to be
+          synced on a schedule, and a plugin that starts contacting portals by
+          itself after an upgrade is not a good surprise.
+        * whose account it was. ``m3u_refresh`` fires for *every* M3U account on
+          the install, so without this a user refreshing an unrelated playlist
+          would set off a full round of portal logins.
+        * the cooldown. A scheduled sync ends by asking Dispatcharr to re-read
+          the playlist it just wrote, and that re-read emits this same event --
+          so the ring has to be broken somewhere, and this is where.
+        """
+        if self._refresh_hours(settings) <= 0:
+            return "scheduled refresh is off"
+
+        payload = params.get("payload") or {}
+        account = str(payload.get("account_name") or "")
+        if not account.startswith(ACCOUNT_PREFIX):
+            return f"'{account}' is not one of ours"
+
+        # Long enough to outlast the sync it is guarding, which on a large
+        # portal with a guide is minutes rather than seconds.
+        if not claim_auto_sync(ttl=AUTO_SYNC_COOLDOWN):
+            return "a scheduled sync ran too recently"
+
+        logger.info(
+            "distalker: answering the scheduled refresh of '%s'", account
+        )
+        return ""
+
+    @staticmethod
+    def _refresh_hours(settings: Dict[str, Any]) -> int:
+        """The schedule in hours, or 0. Never less than an hour when set.
+
+        Below that the cooldown that stops the refresh loop would be longer than
+        the interval, so every other run would be swallowed -- a schedule that
+        silently does half of what it says.
+        """
+        try:
+            hours = int(settings.get("refresh_hours") or 0)
+        except (TypeError, ValueError):
+            return 0
+        return max(1, hours) if hours > 0 else 0
 
     @staticmethod
     def _already_running() -> str:
@@ -590,13 +728,21 @@ class Plugin:
             parts.append(f"leaving {len(plan['unchanged'])} untouched")
         return "; ".join(parts) + ". Refresh the Plugins page for the result."
 
-    def run_sync_now(self, full: bool = False) -> Dict[str, Any]:
+    def run_sync_now(self, full: bool = False, logger=None) -> Dict[str, Any]:
         """The sync itself, off the request thread. Entry point for the thread.
 
         Loads its own settings, because a background thread has no request
         context and no panel state to be handed.
+
+        The caller may hand its logger over, and the scheduled path does.
+        Ours -- ``_dispatcharr_plugin_distalker.plugin`` -- reaches the
+        container log from a uWSGI worker and not from a Celery one, so a
+        scheduled sync wrote its whole run to nowhere: no 'synced' line, no
+        channel counts, nothing to tell a working refresh from one that never
+        happened. Dispatcharr's own logger, the one handed to every action,
+        prints from both.
         """
-        logger = logging.getLogger(__name__)
+        logger = logger or logging.getLogger(__name__)
         settings = self._settings_with_defaults()
         settings = self._reconcile_registry(settings, logger)
         settings = self._migrate_legacy_globals(settings, logger)
@@ -632,8 +778,13 @@ class Plugin:
         for cfg in portals:
             save_portal(cfg)
 
+        # Before the fetch, and regardless of it: the schedule is a global
+        # setting, so no portal ever looks "changed" because of it and the
+        # plan would leave every account untouched.
+        apply_refresh_interval(self._refresh_hours(settings), logger)
+
         targets = portals if full else plan["new"] + plan["changed"]
-        outcome = sync_all(targets, logger)
+        outcome = sync_all(targets, logger, refresh_hours=self._refresh_hours(settings))
 
         # Portals the user deleted stop resolving. Their M3U account and
         # channels stay: deleting those is a decision, not a side effect.
@@ -725,6 +876,11 @@ class Plugin:
                 entry += f", expires {state['expires']:%d %b %Y}"
             if just and just.get("blocked"):
                 entry += " -- THE PORTAL REPORTS THIS ACCOUNT AS BLOCKED"
+            # Dispatcharr's own guide toast names the source by its numeric id
+            # and nothing else (apps/epg/utils.py, send_epg_update), so this is
+            # the only place the portal's name and its guide appear together.
+            if just and just.get("epg"):
+                entry += f", guide for {just['epg']['channels']} of them"
             if just:
                 entry += " (just fetched)"
             lines.append(entry)
@@ -773,6 +929,12 @@ class Plugin:
             publish_fallback(settings.get("fallback_profile") or "")
         except Exception:
             logger.exception("distalker: could not republish the fallback profile")
+
+        # Here rather than only in _sync_portals, because the path that most
+        # needs it never gets there: changing the schedule changes no portal,
+        # so Sync finds nothing to fetch, returns early -- and returns through
+        # this function. Idempotent, and it writes only when the value differs.
+        apply_refresh_interval(self._refresh_hours(settings), logger)
 
         return published
 

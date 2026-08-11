@@ -33,6 +33,11 @@ script with its own `__main__` block:
 
 ```bash
 python3 tests/test_config.py       # portal-line parsing, STB defaults, pseudo-URLs
+python3 tests/test_auth.py         # which authentication a portal asks for
+python3 tests/test_transport.py    # what a request carries, and when it is retried
+python3 tests/test_listing.py      # reading a portal's channel list
+python3 tests/test_epg.py          # the guide, and the tvg-id both halves share
+python3 tests/test_schedule.py     # being woken by Dispatcharr's own clock
 python3 tests/test_registry.py     # surviving the settings panel
 python3 tests/test_manifest.py     # plugin.json vs plugin.py, and run()'s plumbing
 python3 tests/test_fallback.py     # non-portal sources on a Distalker channel
@@ -90,6 +95,17 @@ git tag v0.9.1 && git push origin v0.9.1
 which the workflow gates on two things — the tag must match `plugin.json`, and
 `CHANGELOG.md` must have a section for that version, which becomes the release
 body. A changelog nobody is obliged to write is one that stops being written.
+
+That section is written in two parts, separated by a `<!-- details -->` line:
+
+- Above it, what upgrading gets you — a line per subject, plus anything that has
+  to be done by hand after installing. This is what the release page shows, and
+  it is read by someone deciding whether to upgrade at all.
+- Below it, why each of those exists: the portal behaviour that forced it, what
+  was tried first, what is deliberately not done. Nobody reads that on a release
+  page, and everybody wants it six months later when the same thing breaks.
+
+A section with no marker is published whole, so nothing has to be back-filled.
 
 Keep changes to `.github/workflows/` in their own commit: pushing one needs a
 token carrying the `workflow` scope, which not every contributor's will have,

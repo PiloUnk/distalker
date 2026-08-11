@@ -1,6 +1,6 @@
 {
   "name": "Distalker",
-  "version": "0.9.2",
+  "version": "0.9.3",
   "description": "Stalker/MAG portal support for Dispatcharr. Syncs portal channels into a native M3U account and resolves short-lived stream links at tune time -- no extra containers, no extra ports.",
   "author": "PiloUnk",
   "license": "AGPL-3.0-only",
@@ -19,7 +19,7 @@
       "type": "text",
       "default": "",
       "placeholder": "http://portal.example.com:8080/c/ | 00:1A:79:AA:BB:CC",
-      "help_text": "Portal URL | MAC address, one line each. The name is taken from the host, so put one in front only if you want a different label -- or if two portals share a host, which the sync will then ask you to do. Trailing key=value pairs cover the rest: username, password, max_streams, model, serial, device_id, device_id2, timezone. A line starting with '#' is ignored, which is how you suspend a portal without losing its channels. Credentials are stored unencrypted and are visible in this box."
+      "help_text": "Portal URL | MAC address, one line each. The name is taken from the host, so put one in front only if you want a different label -- or if two portals share a host, which the sync will then ask you to do. Trailing key=value pairs cover the rest: username, password, max_streams, model, serial, device_id, device_id2, timezone, and epg=1 to fetch this portal's programme guide (epg_hours=48 for more than a day -- a guide is by far the largest thing a sync downloads, which is why it is off unless asked for). A line starting with '#' is ignored, which is how you suspend a portal without losing its channels. Credentials are stored unencrypted and are visible in this box."
     },
     {
       "id": "status",
@@ -64,6 +64,13 @@
       "type": "boolean",
       "default": true,
       "help_text": "Give a channel the Distalker profile as soon as it gains a portal stream, again after every M3U refresh, and once more if a channel ever fails to start -- which repairs any channel created while the plugin was disabled or upgrading. Dispatcharr resolves stream profiles per channel, so a channel without it will not tune its portal source. A channel that also holds sources from other providers gets the profile too -- those sources then play through the fallback profile above instead of Dispatcharr's direct relay."
+    },
+    {
+      "id": "refresh_hours",
+      "label": "Refresh every (hours)",
+      "type": "number",
+      "default": 0,
+      "help_text": "0 keeps everything manual: portals are only fetched when you press Sync. Any other value asks Dispatcharr to refresh this plugin's M3U accounts on that schedule, and each refresh re-fetches its portal -- channels and, where 'epg=1' is set, the programme guide. Minimum 1 hour."
     }
   ],
   "actions": [
@@ -86,7 +93,10 @@
       "label": "Re-fetch everything",
       "description": "Download every portal's channel list again, changed or not. Sync only fetches what you edited, so this is how you pick up a line-up that changed at the provider. Slow, and it spends one connection per portal.",
       "button_label": "Re-fetch all",
-      "button_variant": "light"
+      "button_variant": "light",
+      "events": [
+        "m3u_refresh"
+      ]
     },
     {
       "id": "apply_profile",

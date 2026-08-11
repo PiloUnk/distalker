@@ -51,10 +51,17 @@ FIELD_TYPES = {"boolean", "number", "string", "text", "select", "info"}
 
 
 class NullLogger:
-    def info(self, *a, **k): pass
-    def warning(self, *a, **k): pass
-    def error(self, *a, **k): pass
-    def exception(self, *a, **k): pass
+    """Swallows anything a logger is asked to do.
+
+    A catch-all rather than a list of methods: naming them one by one means a
+    handler that reaches for a level nobody thought of raises AttributeError
+    *inside* run()'s own except clause, and the failure surfaces as the action
+    reporting something unrelated -- which is a long way to travel to discover
+    that a stub was missing a method.
+    """
+
+    def __getattr__(self, _name):
+        return lambda *a, **k: None
 
 
 class FakeTasks:
@@ -109,7 +116,7 @@ def run(p, action, settings):
     return p.run(action, {}, {"settings": dict(settings), "logger": NullLogger()})
 
 
-PORTALS = "http://weaseltv.live/c/ | 00:1A:79:29:53:38\n"
+PORTALS = "http://portal.example/c/ | 00:1A:79:AA:BB:CC\n"
 
 
 @contextlib.contextmanager
@@ -249,7 +256,7 @@ def test_settings_never_travel_back_in_the_result():
     p, store, _ = make_plugin({})
     try:
         result = run(p, "sync_now", {
-            "portals": "http://weaseltv.live/c/ | 00:1A:79:29:53:38 | password=hunter2"
+            "portals": "http://portal.example/c/ | 00:1A:79:AA:BB:CC | password=hunter2"
         })
         assert "settings" not in result
         assert "hunter2" not in json.dumps(result)
@@ -494,7 +501,7 @@ def test_assigning_the_profile_also_republishes_the_portals():
             {"event": "channel_error", "payload": {}},
             {"settings": dict(store["settings"]), "logger": NullLogger()},
         )
-        assert published == ["weaseltv"]
+        assert published == ["portal"]
     finally:
         (plugin_mod.apply_stream_profile, plugin_mod.save_portal,
          plugin_mod.publish_fallback) = originals

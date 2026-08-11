@@ -11,6 +11,7 @@ is written, that it is read when Redis is empty, unreachable or corrupt, that
 Redis is repopulated from it, and that the one thing with no mirror -- the
 session token -- degrades to "no cache" rather than raising.
 """
+import importlib.util
 import os
 import shutil
 import sys
@@ -25,11 +26,18 @@ sys.path.insert(0, REPO)
 
 import stalker_api as s  # noqa: E402
 
+# resolver.py runs as a script, so it imports as a plain top-level module.
+_spec = importlib.util.spec_from_file_location(
+    "resolver", os.path.join(REPO, "resolver.py")
+)
+resolver = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(resolver)
+
 CFG = s.PortalConfig(
-    slug="weasel-tv",
-    name="Weasel TV",
-    url="http://weaseltv.live/c/",
-    mac="00:1A:79:29:53:38",
+    slug="livingroom",
+    name="Living Room",
+    url="http://portal.example/c/",
+    mac="00:1A:79:AA:BB:CC",
     username="jo",
     password="hunter2",
     timeout=90,
@@ -237,6 +245,39 @@ def test_the_token_is_not_written_to_disk():
     assert not os.path.isdir(s.STATE_DIR) or not [
         name for name in os.listdir(s.STATE_DIR) if "token" in name
     ]
+
+
+def test_a_channel_the_portal_refuses_still_leaves_a_usable_token():
+    """The handshake worked; only the link did not.
+
+    Caching after the link would mean a portal refusing one channel -- a
+    connection limit, a subscription gap -- sent every later tune through a
+    fresh handshake to learn the same thing.
+    """
+    reset()
+    client = FakeRedis()
+    s.save_portal(CFG, client)
+
+    class Refusing(s.Portal):
+        def login(self):
+            self.token = "fresh"
+            return self.token
+
+        def create_link(self, cmd):
+            raise s.PortalError("connection limit reached")
+
+    original_portal, original_redis = s.Portal, s.get_redis
+    s.Portal, s.get_redis = Refusing, lambda: client
+    try:
+        resolver.resolve(CFG.slug, "ffmpeg http://localhost/ch/1_")
+    except s.PortalError:
+        pass
+    else:
+        raise AssertionError("the refusal must still reach the caller")
+    finally:
+        s.Portal, s.get_redis = original_portal, original_redis
+
+    assert s.get_cached_token(CFG.slug, client) == "fresh"
 
 
 # -- the interpreter the stream profile is built with -------------------------
