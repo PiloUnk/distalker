@@ -40,6 +40,13 @@ jobs:
       # entry does not happen. A changelog nobody is obliged to write is a
       # changelog that stops being written, and the reader of a release page
       # deserves better than a list of commit subjects.
+      #
+      # Only the part of the section above the "<!-- details -->" marker is
+      # published, though: a release page is read by someone deciding whether to
+      # upgrade, who wants a line per subject, while the prose below the marker
+      # is the reasoning behind each one and belongs to whoever goes looking for
+      # it in the file. A section without the marker is published whole, so an
+      # entry written before this split still releases.
       - name: Take the release notes from CHANGELOG.md
         run: |
           python3 - "${GITHUB_REF_NAME#v}" <<'PY' > release-notes.md
@@ -53,7 +60,10 @@ jobs:
           )
           if section is None or not section.group(1).strip():
               sys.exit(f"CHANGELOG.md has no entry for {version}")
-          print(section.group(1).strip())
+          summary = section.group(1).split("<!-- details -->")[0].strip()
+          if not summary:
+              sys.exit(f"the {version} entry is all detail and no summary")
+          print(summary)
           PY
 
       - name: Install test dependencies
