@@ -1,12 +1,33 @@
 # Changelog
 
-## Unreleased
+## 0.9.3
 
-**After upgrading, press Test portals, then Re-fetch all.** Sync alone will
-report every portal as unchanged and fetch nothing: it compares your settings
-against what was last published, and none of them changed — only the code did.
-Test first, since it writes nothing and is where a portal that now needs
-credentials will say so.
+**After upgrading, restart Dispatcharr, then press Test portals and Re-fetch
+all.** The restart is what puts every worker on the new code, since plugins are
+loaded once per process. Sync on its own would then report every portal as
+unchanged and fetch nothing — it compares your settings against what was last
+published, and none of them changed, only the code did. Test writes nothing and
+is where a portal that now wants credentials will say so.
+
+- **Portals can now serve their programme guide.** `epg=1` on a portal line
+  writes an XMLTV file and registers it under **EPGs**; off unless asked for,
+  because a guide is by far the largest thing a sync downloads.
+- **Distalker can be put on a schedule.** *Refresh every (hours)* re-fetches
+  each portal on that interval — channels, and the guide where `epg=1` is set —
+  without anyone pressing Sync. Left at `0`, everything stays manual.
+- **Channels on portals that answer with a resolved link now play**, at sync
+  time and at tune time both, and stop duplicating themselves on every sync.
+- **The portal now decides which authentication it gets**, so an expired or
+  blocked account says so in the provider's own words instead of arriving as an
+  empty channel list.
+- **Portals that will not list their channels in one request now sync**, a page
+  at a time, and a sync survives a portal having a bad minute.
+- **The channel is named in the request as well as in the command**, for the
+  providers that could not find it in the command alone. Reported and first
+  fixed by [@shayward](https://github.com/shayward).
+- Channel logos and archive flags are read as the portal sends them.
+
+<!-- details -->
 
 **Refreshing by itself**
 
