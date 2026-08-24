@@ -284,6 +284,44 @@ Consequences that shape the code:
   (`Plugin._report`). Anything more urgent goes to Dispatcharr's notification
   centre, which does reach an open browser (`sync.announce`).
 
+### The panel is shown a redacted list
+
+The settings row is served to every account on the install and painted straight
+into a textarea, so it is the one copy of the portal list that must not hold a
+credential. `Plugin._save_settings` therefore writes two different things: the
+whole list to `portals.txt`, and `stalker_api.mask_portals()` of it to the row.
+The MAC, `username`, `password`, `device_id`, `device_id2`, `serial` and
+`signature` become `••••`; names, URLs and the tuning keys stay, because a box
+of nothing but bullets is one nobody can recognise their own portals in.
+
+Redaction is a property of the **write path and nothing else**.
+`_reconcile_registry` runs `unmask_portals()` on whatever the panel sent and
+always returns the real list, so every migration, action and sync downstream
+goes on reading plain lines and never has to know.
+
+Four things are easy to break here:
+
+- **Never mirror redacted text.** `_save_settings` checks `is_masked()` before
+  writing `portals.txt`, because `_failed()` can be reached with settings that
+  never passed through `_reconcile_registry` — and mirroring a row of tokens
+  would write them over the only copy of the credentials.
+- **Never redact before the file holds the list.** The guard is
+  `digest(stored) == digest(text)`. A registry that could not be written leaves
+  the row as the only copy there is, and hiding the only copy loses it.
+- **The token stands where the MAC stands.** `split_portal_line` decides which
+  field is which by *where the MAC sits*, so `_mac_index()` counts the token as
+  one; without that, redacting an unnamed line's MAC shifts its fields by one.
+  For the same reason `mask_portals` writes the derived name out.
+- **A redacted line is paired back up by slug, then by URL.** Renaming a portal
+  and repointing it are both ordinary edits, and each changes the half the other
+  is recognised by. Change both at once and nothing matches: the token survives
+  `unmask_portals`, and `Plugin._portals` quotes the line back and asks for it
+  to be retyped rather than parsing a MAC address made of bullets.
+
+None of this is encryption at rest, and the README says so: the resolver reads
+the MAC on every tune with no Django, so `portals.txt` and the state mirrors go
+on holding it in the clear at `0600`.
+
 ### Actions
 
 `plugin.json` is the single definition of the UI; `plugin.py` reads it at import

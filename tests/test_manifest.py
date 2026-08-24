@@ -113,6 +113,11 @@ def publish(line):
 
 
 def run(p, action, settings):
+    # The panel saves the box before running anything -- PluginCard.jsx says so
+    # in as many words -- so the stored row and the context always hold the same
+    # list. Writing it here keeps the two in step; a test handing run() a new
+    # list is simulating a user who has just typed it into the textarea.
+    p._write_settings(dict(settings))
     return p.run(action, {}, {"settings": dict(settings), "logger": NullLogger()})
 
 

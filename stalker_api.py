@@ -1096,6 +1096,234 @@ def normalize_portal_url(url: str) -> str:
     return parsed._replace(path=path).geturl()
 
 
+# -- redaction --------------------------------------------------------------
+#
+# The Portals box was the one place a subscription's credentials were rendered
+# back to whoever opened the page, and Dispatcharr serves a plugin's settings
+# row to every account on the install. So the row keeps a redacted rendering of
+# the list, and the real one lives only in the registry file, which the panel
+# cannot reach -- see registry.py.
+#
+# What this buys is that the credentials are no longer on the screen or in the
+# API response. It is not encryption at rest and must not be sold as such: the
+# resolver reads the MAC on every tune, in a process with no Django, so
+# portals.txt and the state mirrors go on holding it in the clear at 0600.
+
+# U+2022, because the token has to be something no URL, MAC or key=value could
+# be, and something nobody types into the box by accident. An ASCII '****' is a
+# perfectly plausible password.
+MASK = "•" * 4
+
+# Redacted wherever they appear as key=value. The MAC is redacted too, but it
+# is positional and handled apart. The rule is what a value *proves* rather
+# than what it configures: anything a stranger could authenticate with is
+# hidden, while model, timezone, max_streams and the epg switches stay
+# readable -- they tune behaviour, and they are what lets a user recognise
+# their own line.
+SECRET_KEYS = ("username", "password", "device_id", "device_id2",
+               "serial", "signature")
+
+
+def is_masked(text: Optional[str]) -> bool:
+    """True if a portal list carries redacted values rather than real ones."""
+    return MASK in (text or "")
+
+
+def _line_body(line: str) -> Tuple[bool, str]:
+    """Separate a line's comment marker from the portal line inside it.
+
+    A '#' line is how the help text tells users to suspend a portal without
+    losing its channels, so it holds a real MAC and has to be redacted like any
+    other -- and put back together the same way.
+    """
+    stripped = line.strip()
+    if stripped.startswith("#"):
+        return True, stripped.lstrip("#").strip()
+    return False, stripped
+
+
+def _mac_index(parts: List[str]) -> int:
+    """Which '|' field holds the MAC, by split_portal_line's own rule.
+
+    The token counts as a MAC here. Without that, redacting the MAC would move
+    the fields of an unnamed line: 'url | MAC | extras' reads correctly only
+    because the second field looks like a MAC, and 'url | <token> | extras'
+    would otherwise be read as name, url and MAC.
+    """
+    if len(parts) >= 3 and not (
+        MAC_RE.match(normalize_mac(parts[1])) or parts[1].strip() == MASK
+    ):
+        return 2
+    return 1
+
+
+def _line_slug(line: str) -> str:
+    """The slug a portal line is filed under, tolerating a redacted MAC.
+
+    This is what pairs a redacted line back up with the real one it was made
+    from, so the two have to agree even though one of them no longer has a MAC.
+    """
+    parts = [p.strip() for p in _line_body(line)[1].split("|")]
+    if len(parts) < 2:
+        return ""
+    at = _mac_index(parts)
+    name = parts[0] if at == 2 else ""
+    return slugify(name or name_from_url(parts[at - 1]))
+
+
+def _mask_extras(segment: str) -> str:
+    """Redact the secrets among one segment's key=value pairs."""
+    try:
+        tokens = shlex.split(segment)
+    except ValueError:
+        return segment
+    out = []
+    for token in tokens:
+        key, sep, value = token.partition("=")
+        if not sep:
+            out.append(token)
+        elif value and key.strip().lower() in SECRET_KEYS:
+            out.append(f"{key}={MASK}")
+        else:
+            out.append(f"{key}={_quote_if_needed(value)}")
+    return " ".join(out)
+
+
+def _unmask_extras(segment: str, extras: Dict[str, str]) -> str:
+    """Put the secrets back into one segment's key=value pairs."""
+    if MASK not in segment:
+        return segment
+    try:
+        tokens = shlex.split(segment)
+    except ValueError:
+        return segment
+    out = []
+    for token in tokens:
+        key, sep, value = token.partition("=")
+        if sep and value.strip() == MASK:
+            restored = extras.get(key.strip().lower(), "")
+            # Nothing to restore leaves the token standing: see unmask_portals.
+            out.append(f"{key}={_quote_if_needed(restored)}" if restored
+                       else f"{key}={MASK}")
+        elif sep:
+            out.append(f"{key}={_quote_if_needed(value)}")
+        else:
+            out.append(token)
+    return " ".join(out)
+
+
+def mask_portals(text: str) -> str:
+    """Render a portal list with every credential replaced by :data:`MASK`.
+
+    Everything that is not a credential survives -- names, URLs, comments, the
+    tuning keys -- so the box still reads as the user's own configuration, and
+    a portal is still deleted by deleting its line.
+
+    The name is written out even where the line derived it from the URL: it is
+    the identity :func:`unmask_portals` pairs the line back up by, and writing
+    it also settles where the MAC was once the MAC is gone.
+    """
+    out = []
+    for raw in text.splitlines():
+        commented, body = _line_body(raw)
+        if not body:
+            out.append(raw)
+            continue
+
+        parsed, _ = split_portal_line(body)
+        if parsed is None:
+            # A line that does not parse holds no credential we could find, and
+            # the user has to go on seeing it to be able to fix it.
+            out.append(raw)
+            continue
+
+        parts = [p.strip() for p in body.split("|")]
+        at = _mac_index(parts)
+        parts[at] = MASK
+        parts[at + 1:] = [_mask_extras(part) for part in parts[at + 1:]]
+        if at == 1:
+            parts.insert(0, parsed["name"])
+        # format_portal_line() always writes an extras field, empty or not.
+        while len(parts) > 3 and not parts[-1]:
+            parts.pop()
+
+        line = " | ".join(parts)
+        out.append(f"# {line}" if commented else line)
+
+    return "\n".join(out) + ("\n" if text.endswith("\n") else "")
+
+
+def unmask_portals(text: str, stored: str) -> str:
+    """Put the credentials back into a list the panel sent back redacted.
+
+    ``stored`` is the registry's copy, the only place the real values exist.
+    Lines are paired with it by slug, and failing that by URL: renaming a
+    portal and moving one are both ordinary edits, and either would otherwise
+    orphan the line's own MAC. A line typed out in full carries no token and is
+    returned exactly as typed, so pasting a list back in still works.
+
+    A token nothing matches is left standing rather than resolved to an empty
+    value: Plugin._portals refuses a list that still holds one and says which
+    line to retype, which is a great deal easier to act on than a portal
+    quietly authenticating with nothing.
+    """
+    if not is_masked(text):
+        return text
+
+    records = []
+    for raw in (stored or "").splitlines():
+        body = _line_body(raw)[1]
+        if not body:
+            continue
+        parsed, _ = split_portal_line(body)
+        if parsed is None:
+            continue
+        records.append({
+            "slug": _line_slug(body),
+            "url": normalize_portal_url(parsed["url"]),
+            "parsed": parsed,
+            "used": False,
+        })
+
+    def take(slug: str, url: str) -> Optional[Dict[str, Any]]:
+        """The stored line this redacted one came from, consumed once.
+
+        Consumed, because a suspended line and its replacement can share both
+        slug and host -- that is what commenting a line out is for -- and the
+        second of them must not be handed the first one's credentials.
+        """
+        for field, wanted in (("slug", slug), ("url", url)):
+            if not wanted:
+                continue
+            for record in records:
+                if not record["used"] and record[field] == wanted:
+                    record["used"] = True
+                    return record["parsed"]
+        return None
+
+    out = []
+    for raw in text.splitlines():
+        commented, body = _line_body(raw)
+        if MASK not in body:
+            out.append(raw)
+            continue
+
+        parts = [p.strip() for p in body.split("|")]
+        at = _mac_index(parts)
+        source = take(_line_slug(body), normalize_portal_url(parts[at - 1]))
+        if source is not None:
+            if parts[at] == MASK:
+                parts[at] = source["mac"]
+            parts[at + 1:] = [
+                _unmask_extras(part, source["extras"]) for part in parts[at + 1:]
+            ]
+
+        line = " | ".join(parts)
+        out.append(f"# {line}" if commented else line)
+
+    return "\n".join(out) + ("\n" if text.endswith("\n") else "")
+
+
 def endpoint_candidates(url: str) -> List[str]:
     """Where a Stalker API might answer for this URL, best guess first.
 

@@ -59,6 +59,7 @@ A plugin that writes credentials to disk should say so plainly:
 | --- | --- |
 | `/data/uploads/m3us/distalker-<slug>.m3u` | The generated playlist |
 | `/data/distalker/portals.txt` | Your portal list verbatim, **credentials included** |
+| Dispatcharr's plugin settings row | The same list with every credential **redacted** — this is the copy the panel renders and the API serves |
 | `/data/distalker/state/*.json` | What the resolver reads at tune time, **credentials included**, `0600` |
 | Redis `distalker:*` | The same, plus the session token |
 
@@ -183,9 +184,16 @@ further `|` characters, quoted where a value contains spaces
 > Raise it only on what your provider told you: exceeding it is the quickest
 > route to a blocked MAC.
 
-> **Credentials are visible in this box**, and stored unencrypted in the
-> Dispatcharr database like every plugin setting. Treat your backups
-> accordingly.
+> **Credentials are hidden once saved.** The MAC, the password and the rest of
+> the account identity come back as `••••` the moment the list is stored: the
+> real line lives in `/data/distalker/portals.txt`, which the settings panel
+> cannot read. Edit around the bullets and what you leave alone is left alone —
+> renaming a portal or repointing its URL both work with the MAC still hidden.
+>
+> **Keep your own copy of each portal line in a password manager.** The box will
+> not give a credential back, and if `/data/distalker` is ever lost the only
+> remaining copy goes with it. Hidden is also not encrypted — see
+> [What it writes, and where](#what-it-writes-and-where).
 
 ### STB identity
 
@@ -392,8 +400,10 @@ deleting it.
   a stock Dispatcharr can run, so *Refresh every (hours)* drives the M3U
   accounts' own refresh interval and answers the event that follows. It works,
   and it is why the interval cannot usefully go below an hour.
-- **Credentials are stored unencrypted**, in the Dispatcharr database and on
-  disk — see [What it writes, and where](#what-it-writes-and-where).
+- **Credentials are stored unencrypted** on disk. The settings panel no longer
+  shows them, but `/data/distalker/portals.txt` and the state mirrors hold them
+  in the clear at `0600`: the resolver reads them on every tune, in a process
+  with no database — see [What it writes, and where](#what-it-writes-and-where).
 - **No session keep-alive.** A cached token is reused and re-issued on demand.
   Portals that drop idle sessions are untested.
 - **One `ffmpeg` per tuned channel**, which is normal for any non-proxy stream
