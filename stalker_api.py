@@ -517,6 +517,32 @@ def stream_id(cmd: str) -> str:
     return found[0].strip()
 
 
+# What a real box leaves raw in the command it hands back, and therefore what
+# the portal sees before PHP form-decodes the query exactly once. The portal's
+# own client concatenates the command into the query string and lets the URL
+# layer escape only what a URL cannot carry; anything already percent-escaped
+# in the command travels with that escape intact.
+#
+# quote(cmd, safe="") escaped the percent sign itself, so a command containing
+# '%3A' left here as '%253A' and arrived at the portal still encoded -- a
+# different string from the one a real box sends, and the stock create_link
+# handler matches on it with preg_match. Portals that answer their listing with
+# an already-encoded URL are exactly the ones canonical_cmd cannot rewrite, so
+# this was worst where it was least recoverable.
+#
+# Everything outside this set is still percent-encoded. That covers what a URL
+# cannot carry -- space, quotes, anything non-ASCII -- and, more to the point,
+# the three characters that would restructure the request around it: '&', '#',
+# and ';' for a PHP configured with it as an argument separator. A portal
+# cannot smuggle extra parameters into our query through a command.
+CMD_SAFE = "%/:?=+,@$[]!*()~-_."
+
+
+def encode_cmd(cmd: str) -> str:
+    """A command as the portal's own client would have put it on the wire."""
+    return quote(cmd, safe=CMD_SAFE)
+
+
 def slugify(value: str) -> str:
     """Reduce a display name to something safe for URLs, keys and filenames."""
     slug = re.sub(r"[^a-z0-9]+", "-", value.strip().lower()).strip("-")
@@ -2088,7 +2114,14 @@ class Portal:
         without it -- see :func:`stream_id`. Only ever sent with a value, so a
         portal that never asked for it sees the request it has always seen.
         """
-        query = f"action=create_link&type=itv&cmd={quote(cmd, safe='')}"
+        query = (
+            "action=create_link&type=itv"
+            f"&cmd={encode_cmd(cmd)}"
+            # What the portal's own player.js sends beside the command. Neither
+            # changes what a live channel answers; both are what a portal
+            # expecting its own client sees on every request except ours.
+            "&disable_ad=0&download=0"
+        )
         channel = stream_id(cmd)
         if channel:
             query += f"&stream={quote(channel, safe='')}"

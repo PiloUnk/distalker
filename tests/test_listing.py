@@ -351,6 +351,25 @@ def test_reading_the_channel_out_of_a_command():
         assert s.stream_id(cmd) == expected, cmd
 
 
+def test_a_command_reaches_the_portal_decoded_exactly_once():
+    """PHP form-decodes the query once, so what is already escaped must stay so.
+
+    quote(cmd, safe="") escaped the percent sign too, so '%3A' went out as
+    '%253A' and the portal read back a string no real box would have sent.
+    """
+    assert s.encode_cmd("ffmpeg http://h/a%3Ab") == "ffmpeg%20http://h/a%3Ab"
+    # The characters a URL keeps raw in a query stay raw, so the bytes we emit
+    # are the bytes a box emits.
+    assert s.encode_cmd("http://h/p?a=1&") .startswith("http://h/p?a=1")
+    # ...except the ones that would restructure our own request around it.
+    for smuggled in ("&", "#", ";"):
+        assert smuggled not in s.encode_cmd(f"http://h/1{smuggled}stream=9"), smuggled
+    # The ordinary case, unchanged: a marker has nothing in it to encode.
+    assert s.encode_cmd("ffmpeg http://localhost/ch/1_") == (
+        "ffmpeg%20http://localhost/ch/1_"
+    )
+
+
 # -- paging --------------------------------------------------------------
 
 
