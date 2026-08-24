@@ -29,6 +29,8 @@ from .stalker_api import (
     python_executable,
     save_fallback,
     save_portal,
+    save_static_cmds,
+    static_commands,
 )
 
 # Where Dispatcharr's own M3U upload endpoint puts files. Reusing it keeps our
@@ -808,9 +810,11 @@ def sync_portal(
     )
     genres = portal.get_genres()
 
-    # The resolver reads this at tune time; publish it before the M3U lands so
-    # a channel can never reference a portal Redis doesn't know about yet.
+    # The resolver reads these at tune time; publish them before the M3U lands
+    # so a channel can never reference a portal Redis doesn't know about yet.
     save_portal(cfg)
+    static = static_commands(channels)
+    save_static_cmds(cfg.slug, static)
 
     path = write_m3u(cfg.slug, build_m3u(portal, channels, genres))
     account, account_created = upsert_account(cfg, path, refresh_hours)
@@ -839,6 +843,17 @@ def sync_portal(
             rewritten,
         )
 
+    if static:
+        # Worth saying for the same reason the rewrite count is: it changes
+        # what happens at tune time, and on the providers concerned it is the
+        # difference between one request to the portal and none.
+        logger.info(
+            "distalker: %s: %d channel(s) are marked as needing no temporary "
+            "link, and will play from their command without asking the portal",
+            cfg.name,
+            len(static),
+        )
+
     epg = sync_epg(cfg, portal, channels, logger, trigger_refresh=trigger_refresh)
 
     return {
@@ -851,6 +866,7 @@ def sync_portal(
         "file": path,
         "expires": snapshot["expires"],
         "blocked": snapshot["blocked"],
+        "static": len(static),
         "epg": epg,
     }
 

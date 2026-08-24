@@ -70,6 +70,26 @@ def resolve(slug: str, cmd: str) -> tuple[str, stalker_api.PortalConfig, str]:
         )
 
     cached = stalker_api.get_cached_token(slug, client)
+
+    # A channel the portal itself marked as needing no temporary link is played
+    # from the command the listing gave, with no request to the portal at all.
+    # That is what the portal's own player does, what pvr.stalker does, and
+    # here it also skips the one request that is known to go wrong: the
+    # providers undoubled_link exists for answer create_link by gluing their
+    # base in front of a command that was already a link, and the reply is
+    # thrown away again a moment later.
+    #
+    # The token is whatever was already cached -- it may be nothing, and that
+    # is not worth a handshake to fix. It only ever feeds a header, and a
+    # command with no query string is not a link the portal minted for a
+    # session in the first place.
+    if cmd in stalker_api.load_static_cmds(slug, client):
+        link = stalker_api.extract_link(cmd)
+        if link:
+            log(f"{slug}: the portal marks this channel as needing no "
+                "temporary link; playing its command as it stands")
+            return link, cfg, cached or ""
+
     portal = stalker_api.Portal(cfg, token=cached or "")
 
     if cached:

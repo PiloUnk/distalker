@@ -20,6 +20,7 @@ The protocol implementation is a Python reimplementation informed by stalkerhek
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import json
 import os
 import re
@@ -587,6 +588,114 @@ CMD_SAFE = "%/:?=+,@$[]!*()~-_."
 def encode_cmd(cmd: str) -> str:
     """A command as the portal's own client would have put it on the wire."""
     return quote(cmd, safe=CMD_SAFE)
+
+
+# Schemes a stream can actually be handed to ffmpeg on. An allowlist, where
+# extract_link deliberately accepts anything with '://': the two answer
+# different questions. What a portal *resolves* may be multicast on a scheme
+# nobody here has met, and refusing to play it would be worse than not
+# recognising it -- but a command the portal never resolved can also be one of
+# its own internal pseudo-URLs ('ffrt4://ch/live/1'), which parses like an
+# address and plays as nothing.
+PLAYABLE_SCHEMES = frozenset(
+    {"http", "https", "udp", "rtp", "rtsp", "rtmp", "rtmps", "srt", "mms"}
+)
+
+
+def _is_portal_local(host: str) -> bool:
+    """Whether a host can only mean the machine that wrote the address.
+
+    'ffrt3 http://localhost/ch/1234_' is an instruction to the portal, never an
+    address a set-top box could open, so a channel carrying one always needs
+    resolving whatever its flags say. Rather more spellings than the obvious
+    one: RFC 6761 reserves every name ending in '.localhost' as well, IPv4
+    gives the whole of 127.0.0.0/8 to loopback, and a portal that writes its
+    own address as an IPv4-mapped IPv6 literal has said the same thing again.
+
+    A host that cannot be read at all counts as local, because the question
+    this answers is "may this be played without asking the portal", and the
+    only safe answer about an address nobody understands is no.
+    """
+    host = (host or "").strip().strip("[]").rstrip(".").lower()
+    if not host:
+        return True
+    if host == "localhost" or host.endswith(".localhost"):
+        return True
+    if host == "localhost.localdomain":
+        return True
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        # A name, and not one of the reserved loopback ones.
+        return False
+    mapped = getattr(address, "ipv4_mapped", None)
+    if mapped is not None:
+        address = mapped
+    return address.is_loopback or address.is_unspecified
+
+
+def portal_flag(value: Any) -> Optional[bool]:
+    """A portal's 1/0 flag, or None when the portal did not set one.
+
+    None is not False, and the difference is the whole of it: a row carrying
+    neither flag is a row the portal said nothing about, and silence has to
+    read as "no evidence" rather than "no". Portals write these as 1/0, as
+    "1"/"0", and occasionally as real booleans.
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if not text:
+        return None
+    return text not in ("0", "false", "no", "off")
+
+
+def plays_without_create_link(cmd: str, needs_link: Optional[bool]) -> bool:
+    """Whether this channel can be played from its command alone.
+
+    The portal's own player.js asks create_link for a channel only when the row
+    asks for it -- because the portal proxies it through a per-session link
+    ('use_http_tmp_link') or picks a storage server per request
+    ('use_load_balancing'). Every other row plays the command the listing
+    already handed over. pvr.stalker does the same and cites that line of
+    player.js for it (ChannelManager::GetStreamURL); iptvnator does the same
+    again, with guards it added for portals that are not Ministra.
+
+    Those guards are here too, and every one of them can only ever push a row
+    back onto the create_link path that exists today -- so none of them is able
+    to break a portal that works now:
+
+    * the portal has to have answered the question at all. Every portal synced
+      before this was read carries no flags, and taking that silence as a "no"
+      would move all of them onto the static path at once.
+    * the command has to contain a URL. 'auto /media/file.mpg' does not, and
+      only create_link turns that into an address.
+    * on a scheme ffmpeg can open -- see PLAYABLE_SCHEMES.
+    * not on a host that can only mean the portal itself.
+
+    The last condition is ours rather than anyone's reference behaviour, and it
+    is what makes this safe in a resolver rather than in a player: the command
+    must carry **no query string**. A link that expires keeps its token there,
+    and the cost of being wrong is not a retry -- by the time a stream fails
+    the resolver has already become ffmpeg, and Dispatcharr has spent this
+    channel's failover on a source that resolved perfectly well. A command with
+    no query has nothing in it that can go stale.
+    """
+    if needs_link is not False:
+        return False
+
+    link = extract_link(cmd)
+    if not link:
+        return False
+
+    parsed = urlparse(link)
+    if parsed.scheme.lower() not in PLAYABLE_SCHEMES:
+        return False
+    if parsed.query:
+        return False
+    return not _is_portal_local(parsed.hostname or "")
 
 
 def slugify(value: str) -> str:
@@ -1222,6 +1331,80 @@ def load_portal(slug: str, client=None) -> Optional[PortalConfig]:
     return cfg
 
 
+def _static_key(slug: str) -> str:
+    return f"{REDIS_PREFIX}:static:{slug}"
+
+
+def _static_mirror(slug: str) -> str:
+    return f"static-{slug}"
+
+
+def static_commands(channels: List["ChannelEntry"]) -> List[str]:
+    """The commands the resolver may play without asking the portal first."""
+    return sorted(
+        {
+            channel.cmd
+            for channel in channels
+            if plays_without_create_link(channel.cmd, channel.needs_link)
+        }
+    )
+
+
+def save_static_cmds(slug: str, commands: List[str], client=None) -> None:
+    """Publish the commands that need no create_link, for the resolver to read.
+
+    Written on every sync including when it is empty, which is what nearly
+    every portal produces -- and what a portal that has *stopped* marking its
+    channels static has to leave behind, rather than inheriting the last list
+    that said otherwise.
+
+    Mirrored first, like the portal itself: if Redis refuses, the sync says so
+    and the resolver still reads the right thing off disk.
+    """
+    payload = list(commands)
+    _mirror_write(_static_mirror(slug), payload)
+    client = client or get_redis()
+    client.set(_static_key(slug), json.dumps(payload))
+
+
+def load_static_cmds(slug: str, client=None) -> set:
+    """The same set back, or an empty one.
+
+    Every path out of here that is not a list lands on the empty set, and that
+    is deliberate rather than lazy: not knowing whether a channel is static has
+    exactly one safe reading, and it is asking the portal -- which is what this
+    plugin did before any of this existed.
+    """
+    client = _client_or_none(client)
+
+    raw = None
+    if client is not None:
+        try:
+            raw = client.get(_static_key(slug))
+        except Exception:
+            raw = None
+    if raw:
+        try:
+            payload = json.loads(raw)
+        except (ValueError, TypeError):
+            payload = None
+        if isinstance(payload, list):
+            return {str(item) for item in payload}
+
+    payload = _mirror_read(_static_mirror(slug))
+    if not isinstance(payload, list):
+        return set()
+
+    # Put it back, so a wiped Redis costs a file read once rather than once
+    # per tune -- the same bargain load_portal makes.
+    if client is not None:
+        try:
+            client.set(_static_key(slug), json.dumps(payload))
+        except Exception:
+            pass
+    return {str(item) for item in payload}
+
+
 def _sync_lock_key() -> str:
     return f"{REDIS_PREFIX}:sync-lock"
 
@@ -1360,8 +1543,9 @@ def published_slugs() -> List[str]:
 
 def forget_portal(slug: str, client=None) -> None:
     _mirror_forget(_portal_mirror(slug))
+    _mirror_forget(_static_mirror(slug))
     client = client or get_redis()
-    client.delete(_portal_key(slug), _token_key(slug))
+    client.delete(_portal_key(slug), _token_key(slug), _static_key(slug))
 
 
 def _fallback_key() -> str:
@@ -1476,6 +1660,10 @@ class ChannelEntry:
     # canonical_cmd. Counted rather than logged per channel, because on the
     # portal that prompted it, 647 of them arrived at once.
     cmd_rewritten: bool = False
+    # Whether the portal says this channel needs a link minted for it before it
+    # can be played. None when the row carried neither flag, which is not the
+    # same as False -- see portal_flag and plays_without_create_link.
+    needs_link: Optional[bool] = None
 
 
 class Portal:
@@ -2036,6 +2224,16 @@ class Portal:
         channel_id = str(row.get("id") or "")
         marker = canonical_cmd(cmd, channel_id)
 
+        # Two flags, one answer: either of them set means the portal mints the
+        # link. A row carrying neither has not answered, and None says so.
+        tmp_link = portal_flag(row.get("use_http_tmp_link"))
+        balanced = portal_flag(row.get("use_load_balancing"))
+        needs_link = (
+            None
+            if tmp_link is None and balanced is None
+            else bool(tmp_link) or bool(balanced)
+        )
+
         return ChannelEntry(
             channel_id=channel_id,
             name=name,
@@ -2047,6 +2245,7 @@ class Portal:
             # Portals write these as 1/0, and sometimes as "1"/"0".
             tv_archive=str(row.get("enable_tv_archive") or "0") not in ("0", ""),
             tv_archive_duration=str(row.get("tv_archive_duration") or ""),
+            needs_link=needs_link,
         )
 
     def get_ordered_list(self, page: int) -> Dict[str, Any]:
