@@ -209,12 +209,17 @@ def main():
 
     # ffmpeg argv construction, as resolver.py builds it.
     import resolver
-    argv = resolver.build_ffmpeg_command(cfg, link)
+    argv = resolver.build_ffmpeg_command(cfg, link, "TOKEN")
     print("ffmpeg argv:", argv)
     assert argv[0] == "ffmpeg"
     assert link in argv
     assert s.USER_AGENT in argv
     assert "pipe:1" in argv
+    # The mock portal answers with a link on another host, which is the shape
+    # a real create_link takes most of the time -- so the session stays here.
+    blob = argv[argv.index("-headers") + 1]
+    assert "mac=" not in blob and "Bearer" not in blob, blob
+    assert "X-User-Agent: Model: " in blob, blob
 
     server.shutdown()
     print("\nALL CHECKS PASSED")

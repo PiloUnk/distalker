@@ -134,6 +134,36 @@ def test_a_missing_user_agent_is_not_the_literal_placeholder():
     assert "{userAgent}" not in " ".join(cmd)
 
 
+def test_the_session_never_leaves_the_portal_that_issued_it():
+    """A create_link URL frequently points somewhere that is nobody's business.
+
+    It carries its own token in the query, so it needs nothing from us; sending
+    the MAC and the session token to it would hand a third party everything
+    required to use the subscription.
+    """
+    cfg = s.PortalConfig(slug="t", name="T", url="http://p.example/c/portal.php",
+                         mac="00:1A:79:AA:BB:CC")
+
+    own = s.stream_headers(cfg, "http://p.example:8080/live/1.ts", "TOK")
+    # A different port is still the portal: panels serve the stream from :8080
+    # next to the portal on :80, and those are the ones gated on the cookie.
+    assert "Cookie" in own and own["Authorization"] == "Bearer TOK"
+
+    for foreign in ("http://cdn.example/live/1.ts",
+                    "https://other.example/live/1.ts",
+                    "udp://239.0.0.1:1234"):
+        headers = s.stream_headers(cfg, foreign, "TOK")
+        assert "Cookie" not in headers, foreign
+        assert "Authorization" not in headers, foreign
+
+    # An https portal answering with an http stream is a downgrade, and the
+    # session must not travel in clear because the portal said so.
+    secure = s.PortalConfig(slug="t", name="T", url="https://p.example/c/portal.php",
+                            mac="00:1A:79:AA:BB:CC")
+    assert "Cookie" not in s.stream_headers(secure, "http://p.example/live/1.ts", "TOK")
+    assert "Cookie" in s.stream_headers(secure, "https://p.example/live/1.ts", "TOK")
+
+
 if __name__ == "__main__":
     failures = 0
     for name, fn in sorted(globals().items()):

@@ -222,18 +222,64 @@ def is_superseded_ffmpeg_args(value: str) -> bool:
     current = " ".join((value or "").split())
     return any(current == " ".join(old.split()) for old in SUPERSEDED_FFMPEG_ARGS)
 
+def stream_credential_safe(portal_url: str, link: str) -> bool:
+    """Whether the stream is the portal's own, and may carry its session.
+
+    The question matters because the answer is a subscriber's credentials. A
+    create_link URL often points somewhere that is nobody's business but its
+    own -- a CDN, an operator's edge, another provider entirely -- and it
+    already carries its own token in the query, so it needs nothing from us.
+    Sending the MAC and the session token there would hand a third party
+    everything required to use the subscription.
+
+    Same host, and never a downgrade from https to http. A different *port* is
+    still the portal: panels routinely serve the stream from :8080 next to the
+    portal on :80, and those are exactly the ones gated on the mac cookie.
+    """
+    try:
+        portal, stream = urlparse(portal_url), urlparse(link)
+    except ValueError:
+        return False
+    if stream.scheme not in ("http", "https"):
+        return False
+    host = (portal.hostname or "").lower()
+    if not host or host != (stream.hostname or "").lower():
+        return False
+    return not (portal.scheme == "https" and stream.scheme == "http")
+
+
 # Headers a MAG box sends when fetching the stream itself, beyond the
 # User-Agent and Referer that ffmpeg has dedicated flags for. Providers do
 # check these: a request that authenticated fine against the portal can still
 # be refused at the stream if it does not look like the same box.
-def stream_headers(model: str = DEFAULT_MODEL) -> Dict[str, str]:
-    return {
-        "X-User-Agent": f"Model: {model}; Link: Ethernet",
+#
+# The session travels with them when the stream is the portal's own. A MAG
+# sends the mac cookie and the token to everything it fetches from the portal,
+# and panels that gate the stream on that cookie answer a request without it
+# with a 403 -- which arrives as a channel that authenticated, resolved, and
+# then would not play. What the box would never do is send them anywhere else,
+# which is what stream_credential_safe is for.
+def stream_headers(cfg: "PortalConfig", link: str, token: str = "") -> Dict[str, str]:
+    parsed = urlparse(link)
+    headers = {
+        "X-User-Agent": f"Model: {cfg.model}; Link: Ethernet",
         "Accept": "*/*",
         "Accept-Language": "en-US,en;q=0.9",
         "Cache-Control": "no-cache",
         "Pragma": "no-cache",
+        # Derived from the stream, not the portal: providers serve it from
+        # another host or port and expect the request to look like it came
+        # from there.
+        "Origin": f"{parsed.scheme}://{parsed.netloc}",
     }
+    if stream_credential_safe(cfg.url, link):
+        headers["Cookie"] = (
+            f"mac={quote(cfg.mac)}; stb_lang=en; "
+            f"timezone={quote(cfg.timezone)};"
+        )
+        if token:
+            headers["Authorization"] = "Bearer " + token
+    return headers
 
 REDIS_PREFIX = "distalker"
 
