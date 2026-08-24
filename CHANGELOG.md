@@ -1,5 +1,80 @@
 # Changelog
 
+## 0.9.4
+
+**After upgrading, restart Dispatcharr, then press Test portals and Re-fetch
+all.** The restart is what puts every worker on the new code, since plugins are
+loaded once per process. Sync on its own would report every portal as unchanged
+and fetch nothing — it compares your settings against what was last published,
+and nothing in them changed, only the code did.
+
+- **Stalker compatibility improvements.**
+- **Security improvements in the Settings panel, which now masks credentials.**
+
+<!-- details -->
+
+**Talking to more portals**
+
+- **A refusal is recognised however the portal words it.** Ministra answers a
+  rejected session with HTTP 200 and a bare line of text, so only one exact
+  phrase was ever understood; the others arrived as "portal returned non-JSON
+  response" and cost a channel its failover. `Access denied.`, `Unauthorized
+  request.`, the stock server's numeric debug counter and the refusals
+  non-Ministra panels put inside the JSON envelope are all read now, and each
+  says which of the three things is actually wrong: the session, the account,
+  or the MAC.
+- **A portal is looked for on every path one is served from.** Two were probed;
+  five are now — the URL as written first, then `/server/load.php`,
+  `/c/portal.php`, `/portal.php` and `/stalker_portal/server/load.php`. An
+  explicit `.php` in your own URL is no longer swapped for a guess, since that
+  path is the address the provider handed out.
+- **The box describes itself the way a real one does.** The handshake and
+  profile now carry `prehash`, `client_type`, `video_out` and the metrics blob
+  a MAG sends, which is what some panels authenticate on and what the admin
+  panel reads to show a box as connected.
+- **A command reaches the portal decoded exactly once.** A `%` inside a channel
+  command was being encoded twice, so those channels asked for a link that
+  never existed.
+- **Channels the portal marks as needing no temporary link now play without one**
+  — the portal's own player skips `create_link` for them, and so does this. It
+  removes the one request known to go wrong on those providers.
+- **The portal's own streams are fetched as the box that authenticated**, with
+  the session and MAC that minted the link. Never to anyone else's CDN: a
+  stream on another host gets no credentials, which is what keeps a
+  subscriber's MAC out of a request that has no business carrying it.
+- Three things the portal was already saying are now read: the expiry date
+  where Ministra puts it, a device-conflict message with the setting that fixes
+  it named, and a channel listed twice in one response counted once.
+
+**Credentials are no longer displayed**
+
+- **The Portals box hides them once saved.** The MAC, the password and the rest
+  of the account identity come back as `••••`: the real line lives in
+  `/data/distalker/portals.txt`, which the settings panel cannot read. Names,
+  URLs and the tuning keys stay, so the box still reads as your own
+  configuration — and a portal is still deleted by deleting its line.
+- This matters beyond the screen. Dispatcharr serves a plugin's settings row to
+  every account on the install, so the credentials were in an API response
+  anyone could read.
+- **Editing works through the bullets.** Renaming a portal and repointing its
+  URL both keep the MAC you cannot see; pasting a line back in full still
+  works. Change a line's name *and* its URL in one edit and there is nothing
+  left to recognise it by — the plugin then quotes that line back and asks you
+  to retype it, rather than parsing a MAC address made of bullets.
+- **Keep your own copy of each portal line in a password manager.** The box will
+  not give a credential back, and if `/data/distalker` is ever lost the last
+  copy goes with it. Nothing is redacted until that file is known to hold the
+  same list, so a registry that could not be written leaves the credentials
+  where they were.
+- Hiding is not encryption. The resolver reads the MAC on every tune in a
+  process with no database, so `portals.txt` and the state mirrors go on
+  holding it in the clear at `0600` — the README says which files those are.
+- **Settings the panel no longer has a field for are dropped.** Removing a field
+  from the manifest stops the panel rendering it and nothing else, so the
+  Add-portal form retired in 0.4.0 left a MAC, a password and a portal URL in
+  that same API response — for a portal you may have deleted months ago. They
+  are cleared on the first action after upgrading.
+
 ## 0.9.3
 
 **After upgrading, restart Dispatcharr, then press Test portals and Re-fetch

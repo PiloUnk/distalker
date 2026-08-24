@@ -94,8 +94,11 @@ def test_url_normalisation():
         # An explicit load.php must survive: older portals only serve that.
         "http://a.example/stalker_portal/server/load.php":
             "http://a.example/stalker_portal/server/load.php",
-        # Any other .php is swapped for portal.php in the same directory.
-        "http://a.example/c/other.php": "http://a.example/c/portal.php",
+        # The one departure from stalkerhek, which swaps any other .php for
+        # portal.php in the same directory. Panels under a path of their own
+        # exist, and that path is the address the provider handed out;
+        # endpoint_candidates() probes the standard siblings after it.
+        "http://a.example/c/other.php": "http://a.example/c/other.php",
         # A missing scheme is filled in rather than rejected.
         "somedomain.com:8080/c/": "http://somedomain.com:8080/c/portal.php",
         # Ports and deep paths must be preserved.
@@ -268,6 +271,20 @@ def test_expiry_is_read_from_the_field_resellers_use():
     assert s.parse_expiry(None) is None
 
 
+def test_expiry_is_also_read_from_the_field_ministra_uses():
+    """account_info holds a Unix timestamp, and it is free: login() read it.
+
+    It is also where a portal writes 'never', as 0 or -1. Read as a date, an
+    unlimited account would be reported as having run out in 1970 -- which is
+    the one wrong answer worse than no answer at all.
+    """
+    assert s.parse_expiry(1785000000).year == 2026
+    # Portals send the same value in milliseconds, and mean the same date.
+    assert s.parse_expiry("1785000000000") == s.parse_expiry("1785000000")
+    for unlimited in (0, "0", -1, "-1"):
+        assert s.parse_expiry(unlimited) is None, unlimited
+
+
 def test_the_default_arguments_let_dispatcharr_fail_over():
     """ffmpeg must not reconnect on its own: it retries an expired portal link
     while staying alive, so Dispatcharr sees no failure and never switches to
@@ -338,6 +355,111 @@ def test_a_command_with_nothing_playable_is_refused():
 def test_config_survives_redis_roundtrip():
     (portal,), _ = s.parse_portals("A | http://a.example/c/ | 00:1A:79:AA:BB:CC | max_streams=4")
     assert s.PortalConfig.from_dict(portal.to_dict()) == portal
+
+
+# -- redaction: what the settings panel is allowed to see ---------------------
+
+STORED = (
+    "Salon | http://a.example/c/ | 00:1A:79:00:00:01 | username=joe password=hunter2\n"
+    "http://b.example/c/ | 00:1A:79:00:00:02 | epg=1 model=MAG270 serial=98765\n"
+    "# Suspendu | http://c.example/c/ | 00:1A:79:00:00:03\n"
+)
+
+
+def test_no_credential_survives_the_redaction():
+    """The whole point: nothing in the box lets anyone use the subscription."""
+    masked = s.mask_portals(STORED)
+    for secret in ("00:1A:79:00:00:01", "00:1A:79:00:00:02", "00:1A:79:00:00:03",
+                   "joe", "hunter2", "98765"):
+        assert secret not in masked, f"{secret} is still readable"
+
+
+def test_what_is_not_a_credential_stays_readable():
+    """A box of nothing but bullets is one nobody can recognise their own
+    portals in, so everything that only tunes behaviour is left alone."""
+    masked = s.mask_portals(STORED)
+    for kept in ("Salon", "http://a.example/c/", "epg=1", "model=MAG270", "# "):
+        assert kept in masked, f"{kept} should not have been hidden"
+
+
+def test_the_redaction_means_exactly_the_same_thing_once_undone():
+    """A round trip has to be invisible to everything downstream, comments and
+    all -- a suspended line holds a real MAC and is how a portal is paused."""
+    restored = s.unmask_portals(s.mask_portals(STORED), STORED)
+    before, _ = s.parse_portals(STORED)
+    after, errors = s.parse_portals(restored)
+    assert not errors
+    assert [p.to_dict() for p in before] == [p.to_dict() for p in after]
+    # Not compared as text: a redacted line writes its derived name out. What
+    # has to survive is what the line means, and that a paused portal is still
+    # paused rather than quietly back in the line-up.
+    assert "# Suspendu | http://c.example/c/ | 00:1A:79:00:00:03" in restored
+    assert [p.slug for p in after] == ["salon", "b"]
+
+
+def test_a_line_typed_out_in_full_is_taken_as_typed():
+    """Pasting the list back in from a password manager has to keep working."""
+    added = s.mask_portals(STORED) + "New | http://d.example/c/ | 00:1A:79:00:00:04\n"
+    restored = s.unmask_portals(added, STORED)
+    assert "New | http://d.example/c/ | 00:1A:79:00:00:04" in restored
+    assert not s.is_masked(restored)
+
+
+def test_a_renamed_or_moved_portal_keeps_its_own_credentials():
+    """Renaming a portal and repointing it are both ordinary edits, and either
+    one changes the half of the line the other is recognised by. So both are
+    tried: the slug first, the URL after it."""
+    masked = s.mask_portals(STORED)
+
+    renamed = s.unmask_portals(masked.replace("Salon |", "Sejour |"), STORED)
+    assert "Sejour | http://a.example/c/ | 00:1A:79:00:00:01" in renamed
+    assert "password=hunter2" in renamed
+
+    moved = s.unmask_portals(masked.replace("http://a.example/c/", "http://z.example/c/"),
+                             STORED)
+    assert "Salon | http://z.example/c/ | 00:1A:79:00:00:01" in moved
+
+
+def test_a_line_nothing_recognises_stays_hidden_rather_than_emptied():
+    """Renaming *and* moving a line in one edit leaves nothing to pair it up
+    by. Leaving the token standing is what lets the plugin name the line and
+    ask for it again; an empty MAC would authenticate as nobody and say so in
+    a message about the portal instead of about the edit."""
+    masked = s.mask_portals(STORED)
+    orphan = masked.replace("Salon | http://a.example/c/", "Sejour | http://z.example/c/")
+    restored = s.unmask_portals(orphan, STORED)
+    assert s.is_masked(restored)
+    assert "00:1A:79:00:00:02" in restored, "the other lines still come back"
+
+
+def test_deleting_a_hidden_line_still_deletes_the_portal():
+    """The editing model has to survive the redaction: a line is still a portal
+    and removing it still removes one."""
+    masked = s.mask_portals(STORED)
+    kept = "\n".join(masked.splitlines()[1:]) + "\n"
+    portals, errors = s.parse_portals(s.unmask_portals(kept, STORED))
+    assert not errors
+    assert [p.slug for p in portals] == ["b"]
+
+
+def test_the_name_is_written_out_so_the_mac_field_stays_findable():
+    """split_portal_line() decides which field is which by where the MAC sits.
+    Redact the MAC on a line that never named its portal and the fields shift
+    by one, so the redaction writes the derived name rather than lose them."""
+    masked = s.mask_portals("http://b.example/c/ | 00:1A:79:00:00:02 | epg=1\n")
+    assert masked == f"b | http://b.example/c/ | {s.MASK} | epg=1\n"
+
+
+def test_an_unparseable_line_is_left_where_the_user_can_see_it():
+    masked = s.mask_portals("this is not a portal line\n")
+    assert masked == "this is not a portal line\n"
+
+
+def test_the_token_is_not_something_anyone_types_by_accident():
+    """A password of four asterisks is plausible; four bullets are not."""
+    assert s.MASK == "\u2022" * 4
+    assert not s.is_masked(STORED)
+    assert s.is_masked(s.mask_portals(STORED))
 
 
 if __name__ == "__main__":

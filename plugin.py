@@ -42,13 +42,16 @@ from .stalker_api import (
     claim_auto_sync,
     forget_portal,
     format_portal_line,
+    is_masked,
     is_superseded_ffmpeg_args,
     load_portal,
+    mask_portals,
     parse_portals,
     published_slugs,
     save_portal,
     split_portal_line,
     sync_lock_age,
+    unmask_portals,
 )
 
 from .sync import (
@@ -128,6 +131,7 @@ class Plugin:
             settings = self._reconcile_registry(settings, logger)
             settings = self._migrate_legacy_globals(settings, logger)
             settings = self._migrate_ffmpeg_args(settings, logger)
+            settings = self._drop_unknown_settings(settings, logger)
             self._drop_legacy_schedule(logger)
 
             result = handler(params or {}, settings, logger)
@@ -293,6 +297,41 @@ class Plugin:
         self._save_settings(updated)
         return updated
 
+    def _drop_unknown_settings(self, settings: Dict[str, Any], logger) -> Dict[str, Any]:
+        """Delete stored settings no field in the manifest declares any more.
+
+        Taking a field out of plugin.json only stops the panel *rendering* it.
+        The value stays in PluginConfig.settings, which Dispatcharr serves to
+        every account on the install -- so the Add-portal form that went in
+        0.4.0 left a MAC, a password and a portal URL sitting in the API
+        response for months, belonging to a portal the user had since dropped.
+        Redacting the portal list and leaving those behind would have been
+        half a job.
+
+        The manifest is the single definition of the panel, so anything it does
+        not declare is dead by construction; test_manifest.py pins that every
+        setting the code reads is declared. Runs after the migrations, which
+        read keys of their own that this would otherwise take first.
+
+        The open panel goes on replaying the stale keys until the page is
+        reloaded -- it PUTs the state it fetched, same as with the portal list
+        -- so this runs on every action rather than once.
+        """
+        known = {field["id"] for field in self.fields}
+        stale = sorted(key for key in self._raw_settings() if key not in known)
+        if not stale:
+            return settings
+
+        updated = {k: v for k, v in settings.items() if k in known}
+        logger.info(
+            "distalker: dropped %d stored setting(s) the panel no longer has a "
+            "field for: %s",
+            len(stale),
+            ", ".join(stale),
+        )
+        self._save_settings(updated)
+        return updated
+
     def _settings_with_defaults(self) -> Dict[str, Any]:
         """Stored settings over the manifest's defaults.
 
@@ -329,17 +368,41 @@ class Plugin:
         cfg.save(update_fields=["settings", "updated_at"])
 
     def _save_settings(self, settings: Dict[str, Any]) -> None:
-        """Persist settings the plugin changed itself."""
-        self._write_settings(settings)
+        """Persist settings the plugin changed itself.
 
+        The portal list is stored twice and deliberately not the same way. The
+        registry file takes it whole, because the next action and the resolver
+        need the credentials; the settings row takes the redacted rendering,
+        because Dispatcharr serves that row to every account on the install and
+        the panel paints it straight into a textarea.
+
+        ``settings`` always carries the real list here -- redaction happens on
+        the way out and nowhere else, so every caller in between goes on
+        reading and rewriting plain lines.
+        """
         # Mirror the list somewhere the settings panel cannot reach, and flag it
         # as a write the open panel has no way of knowing about. Saves that
         # leave the list alone -- recording a status, clearing the form -- skip
         # this entirely: rewriting the same text would renew the marker and go
         # on distrusting a panel that is in fact still in step with the list.
+        #
+        # Redacted text is never mirrored. _failed() can be reached with
+        # settings that never went through _reconcile_registry -- an error
+        # raised inside it, for one -- and mirroring a row full of tokens would
+        # write the tokens over the only copy of the credentials.
         text = settings.get("portals") or ""
-        if digest(text) != digest(load_registry()):
+        if not is_masked(text) and digest(text) != digest(load_registry()):
             save_registry(text, pending=True)
+
+        stored = load_registry()
+        row = dict(settings)
+        # Redact only once the file is known to hold the same list. A registry
+        # that could not be written leaves this row as the only copy there is,
+        # and hiding the only copy is how a configuration gets lost.
+        if stored is not None and digest(stored) == digest(text):
+            row["portals"] = mask_portals(text)
+
+        self._write_settings(row)
 
     @staticmethod
     def _worth_recording(params: Dict[str, Any], result: Dict[str, Any]) -> bool:
@@ -397,10 +460,20 @@ class Plugin:
         what the plugin wrote, so the file wins. Once the panel quotes the
         current list back -- which happens as soon as it is reopened -- the
         marker clears and the textarea is authoritative again.
+
+        Returns settings carrying the *real* list in every case, whatever the
+        row and the panel hold. Everything downstream -- the migrations, the
+        actions, the sync -- reads plain lines and never has to know that the
+        stored copy is redacted.
         """
         stored = load_registry()
         raw = self._raw_settings()
         panel_value = raw.get("portals")
+
+        def adopt(text: str) -> Dict[str, Any]:
+            updated = dict(settings)
+            updated["portals"] = text or ""
+            return updated
 
         if panel_value is None:
             if stored:
@@ -409,14 +482,36 @@ class Plugin:
                     "restoring it from %s",
                     REGISTRY_PATH,
                 )
-                settings = dict(settings)
-                settings["portals"] = stored
+                settings = adopt(stored)
                 self._save_settings(settings)
             return settings
 
-        if (panel_value or "").strip() == (stored or "").strip():
+        # The panel can only send back what it was shown, and what it was shown
+        # is redacted. Undo that before anything compares or parses it.
+        plain = unmask_portals(panel_value, stored or "")
+
+        # "Unchanged" is judged against whatever the panel was actually holding.
+        # A redacted list has to be compared with the redaction: a line that
+        # never named its portal comes back with the derived name written out,
+        # and that is the rendering's doing rather than an edit. Comparing the
+        # plain text instead would read every reopened panel as a hand edit and
+        # rewrite the file for nothing. The redaction is *not* used to judge a
+        # list typed in full: it hides the MAC, so a hand-corrected MAC would
+        # compare equal to the one it replaced.
+        if is_masked(panel_value):
+            unchanged = panel_value.strip() == mask_portals(stored or "").strip()
+        else:
+            unchanged = plain.strip() == (stored or "").strip()
+
+        if unchanged:
             # The panel has caught up, so whatever it sends next can be trusted.
             clear_pending()
+            settings = adopt(stored)
+            # An install upgrading into this version still has its credentials
+            # in the settings row, and a panel that never edits the box would
+            # never trigger a save. This is where those rows get redacted, once.
+            if panel_value != mask_portals(stored or ""):
+                self._save_settings(settings)
             return settings
 
         if is_pending():
@@ -426,19 +521,36 @@ class Plugin:
                 "panel to edit the list by hand.",
                 REGISTRY_PATH,
             )
-            settings = dict(settings)
-            settings["portals"] = stored or ""
+            settings = adopt(stored)
             self._save_settings(settings)
             return settings
 
+        # A token that survived unmask_portals() belongs to a line nothing in
+        # the registry answers for -- a lost /data/distalker, or a line renamed
+        # *and* moved in one edit. Adopting it would write bullets over the
+        # only copy of the credentials, so the list is left exactly as it is
+        # and _portals() names the offending lines and refuses.
+        if is_masked(plain):
+            logger.error(
+                "distalker: the settings panel sent back portal lines whose "
+                "credentials are not in %s; leaving the stored list alone",
+                REGISTRY_PATH,
+            )
+            return adopt(plain)
+
         # Hand-edited in the textarea, or the very first run.
-        if not save_registry(panel_value):
+        settings = adopt(plain)
+        if not save_registry(plain):
             logger.warning(
                 "distalker: could not write %s; the portal list is only "
                 "stored in the plugin settings and may be lost",
                 REGISTRY_PATH,
             )
+            # Left in the row as it came, credentials and all: with no file to
+            # read them back from, redacting them here would erase them.
+            return settings
 
+        self._save_settings(settings)
         return settings
 
     # -- actions ----------------------------------------------------------
@@ -449,7 +561,25 @@ class Plugin:
         Partially applying a mistyped config is worse than doing nothing: it
         would leave half the accounts pointing at stale files.
         """
-        portals, errors = parse_portals(settings.get("portals") or "")
+        text = settings.get("portals") or ""
+
+        # A line still holding a redaction token got here without its
+        # credentials, and _reconcile_registry could not find them: either the
+        # registry is gone, or the line was renamed *and* moved in one edit,
+        # which leaves nothing to recognise it by. Parsing on would report a
+        # MAC address made of bullets, which explains nothing.
+        if is_masked(text):
+            lines = [
+                line.strip() for line in text.splitlines() if is_masked(line)
+            ]
+            raise PortalError(
+                "these portal lines are still hidden and their credentials "
+                f"could not be read back from {REGISTRY_PATH}: "
+                + "; ".join(lines)
+                + " -- retype each of them in full, URL, MAC and password"
+            )
+
+        portals, errors = parse_portals(text)
         if errors:
             raise PortalError("invalid portal configuration -- " + "; ".join(errors))
         if not portals:
@@ -747,6 +877,7 @@ class Plugin:
         settings = self._reconcile_registry(settings, logger)
         settings = self._migrate_legacy_globals(settings, logger)
         settings = self._migrate_ffmpeg_args(settings, logger)
+        settings = self._drop_unknown_settings(settings, logger)
 
         try:
             result = self._sync_portals(settings, logger, full=full)

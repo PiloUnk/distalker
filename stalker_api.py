@@ -19,6 +19,8 @@ The protocol implementation is a Python reimplementation informed by stalkerhek
 
 from __future__ import annotations
 
+import hashlib
+import ipaddress
 import json
 import os
 import re
@@ -66,10 +68,46 @@ STB_IMAGE_VERSION = 216
 STB_HW_VERSION = "1.7-BD-00"
 STB_NUM_BANKS = 1
 
-# What a portal answers with, in plain text and with no JSON around it, once
-# the token it was given is no longer good. Matched exactly because it is a
-# fixed string in Ministra rather than something a reseller writes.
-AUTH_FAILED_BODY = "authorization failed."
+# The refusals Ministra answers with in plain text, HTTP 200 attached and no
+# JSON around them, and what each of them actually means. Matched against the
+# whole body rather than searched for inside it: these are bare phrases, so a
+# proxy or a WAF answering '<html><body>Access denied</body></html>' -- 38
+# characters, under any length a cap would catch -- would otherwise be read as
+# the portal speaking, and send the resolver off to re-authenticate against
+# something that never answered at all.
+#
+# Only the first carries a trailing number, and it is a debug counter rather
+# than anything to read. Matching without it is most of the point of this
+# table: 'Authorization failed. 75' is what the stock server actually sends,
+# and the exact-string comparison this replaces did not recognise it -- so the
+# one refusal the resolver exists to recover from arrived typed as an endpoint
+# failure, which is never re-authenticated on and costs a second request to the
+# other path of a portal that is already refusing us.
+AUTH_REFUSALS = (
+    (
+        re.compile(r"^authorization\s+failed[.!]*(?:\s+\d+)?$", re.I),
+        "portal says the session is no longer authorised",
+    ),
+    (
+        re.compile(r"^access\s+denied[.!]*$", re.I),
+        "portal says this account is denied access",
+    ),
+    (
+        re.compile(r"^unauthorized\s+request[.!]*$", re.I),
+        "portal did not receive the MAC address it authorises on",
+    ),
+)
+
+# Wording accepted inside a JSON envelope's 'error' field, beyond the three
+# above. Wider on purpose, and applied in one narrow place: a panel that fills
+# in 'error' has said something went wrong deliberately -- a reply that worked
+# carries no 'error' at all -- so 'Invalid token' and a bare 'unauthorized' are
+# worth reading there, where the same breadth against an arbitrary body would
+# match half the error pages on the internet.
+ENVELOPE_REFUSAL = re.compile(
+    r"authorization|access\s+denied|unauthorized|auth\s+failed|invalid\s+token",
+    re.I,
+)
 
 # Answers worth asking again for. Everything else is the portal having made up
 # its mind: a 404 is not going to become a 200, and a 403 is the subject of
@@ -185,18 +223,64 @@ def is_superseded_ffmpeg_args(value: str) -> bool:
     current = " ".join((value or "").split())
     return any(current == " ".join(old.split()) for old in SUPERSEDED_FFMPEG_ARGS)
 
+def stream_credential_safe(portal_url: str, link: str) -> bool:
+    """Whether the stream is the portal's own, and may carry its session.
+
+    The question matters because the answer is a subscriber's credentials. A
+    create_link URL often points somewhere that is nobody's business but its
+    own -- a CDN, an operator's edge, another provider entirely -- and it
+    already carries its own token in the query, so it needs nothing from us.
+    Sending the MAC and the session token there would hand a third party
+    everything required to use the subscription.
+
+    Same host, and never a downgrade from https to http. A different *port* is
+    still the portal: panels routinely serve the stream from :8080 next to the
+    portal on :80, and those are exactly the ones gated on the mac cookie.
+    """
+    try:
+        portal, stream = urlparse(portal_url), urlparse(link)
+    except ValueError:
+        return False
+    if stream.scheme not in ("http", "https"):
+        return False
+    host = (portal.hostname or "").lower()
+    if not host or host != (stream.hostname or "").lower():
+        return False
+    return not (portal.scheme == "https" and stream.scheme == "http")
+
+
 # Headers a MAG box sends when fetching the stream itself, beyond the
 # User-Agent and Referer that ffmpeg has dedicated flags for. Providers do
 # check these: a request that authenticated fine against the portal can still
 # be refused at the stream if it does not look like the same box.
-def stream_headers(model: str = DEFAULT_MODEL) -> Dict[str, str]:
-    return {
-        "X-User-Agent": f"Model: {model}; Link: Ethernet",
+#
+# The session travels with them when the stream is the portal's own. A MAG
+# sends the mac cookie and the token to everything it fetches from the portal,
+# and panels that gate the stream on that cookie answer a request without it
+# with a 403 -- which arrives as a channel that authenticated, resolved, and
+# then would not play. What the box would never do is send them anywhere else,
+# which is what stream_credential_safe is for.
+def stream_headers(cfg: "PortalConfig", link: str, token: str = "") -> Dict[str, str]:
+    parsed = urlparse(link)
+    headers = {
+        "X-User-Agent": f"Model: {cfg.model}; Link: Ethernet",
         "Accept": "*/*",
         "Accept-Language": "en-US,en;q=0.9",
         "Cache-Control": "no-cache",
         "Pragma": "no-cache",
+        # Derived from the stream, not the portal: providers serve it from
+        # another host or port and expect the request to look like it came
+        # from there.
+        "Origin": f"{parsed.scheme}://{parsed.netloc}",
     }
+    if stream_credential_safe(cfg.url, link):
+        headers["Cookie"] = (
+            f"mac={quote(cfg.mac)}; stb_lang=en; "
+            f"timezone={quote(cfg.timezone)};"
+        )
+        if token:
+            headers["Authorization"] = "Bearer " + token
+    return headers
 
 REDIS_PREFIX = "distalker"
 
@@ -217,7 +301,7 @@ class PortalEndpointError(PortalError):
 
     A 404, or a body that is not JSON at all. Separated because it is the one
     failure with a second thing worth trying: the same portal on its other
-    path -- see :func:`alternate_endpoint`.
+    path -- see :func:`endpoint_candidates`.
     """
 
 
@@ -230,6 +314,49 @@ class PortalAuthError(PortalError):
     portal's own wording ("blocked", "subscription expired") says more than
     anything this plugin could infer.
     """
+
+
+def auth_refusal(body: Any) -> str:
+    """What a plain-text answer says about the session, or "" if it says nothing."""
+    text = str(body or "").strip()
+    for pattern, message in AUTH_REFUSALS:
+        if pattern.match(text):
+            return message
+    return ""
+
+
+def envelope_refusal(payload: Any) -> str:
+    """The same, for portals that refuse inside the envelope rather than instead of it.
+
+    Not Ministra's behaviour, and common in what this plugin actually meets.
+    Every one of these used to arrive as an ordinary reply: ``get_genres``
+    answered ``{'js': {'error': 'Invalid token'}}`` counted as a portal with no
+    genres, and 'Test portals' reported it as authenticated with 0 groups.
+
+    ``error`` is read with the wide vocabulary. ``msg`` only with the three
+    exact bodies, and only when nothing else in the reply has already given a
+    verdict: a reply carrying a ``status`` is one :meth:`Portal.login` reads
+    for itself, including the sentence beside it -- which is the provider's own
+    wording, and better than anything this could substitute for it.
+    """
+    js = payload.get("js") if isinstance(payload, dict) else None
+    # Some panels put the phrase straight in 'js' rather than in a field of it.
+    if isinstance(js, str):
+        return auth_refusal(js)
+    if not isinstance(js, dict):
+        return ""
+
+    if js.get("status") is None:
+        exact = auth_refusal(js.get("msg"))
+        if exact:
+            return exact
+
+    error = str(js.get("error") or "").strip()
+    # A field longer than a sentence is a document somebody stuffed in there,
+    # not a refusal worth quoting back at the user.
+    if error and len(error) <= 200 and ENVELOPE_REFUSAL.search(error):
+        return f"portal refused the session: {error}"
+    return ""
 
 
 # ---------------------------------------------------------------------------
@@ -437,6 +564,140 @@ def stream_id(cmd: str) -> str:
     return found[0].strip()
 
 
+# What a real box leaves raw in the command it hands back, and therefore what
+# the portal sees before PHP form-decodes the query exactly once. The portal's
+# own client concatenates the command into the query string and lets the URL
+# layer escape only what a URL cannot carry; anything already percent-escaped
+# in the command travels with that escape intact.
+#
+# quote(cmd, safe="") escaped the percent sign itself, so a command containing
+# '%3A' left here as '%253A' and arrived at the portal still encoded -- a
+# different string from the one a real box sends, and the stock create_link
+# handler matches on it with preg_match. Portals that answer their listing with
+# an already-encoded URL are exactly the ones canonical_cmd cannot rewrite, so
+# this was worst where it was least recoverable.
+#
+# Everything outside this set is still percent-encoded. That covers what a URL
+# cannot carry -- space, quotes, anything non-ASCII -- and, more to the point,
+# the three characters that would restructure the request around it: '&', '#',
+# and ';' for a PHP configured with it as an argument separator. A portal
+# cannot smuggle extra parameters into our query through a command.
+CMD_SAFE = "%/:?=+,@$[]!*()~-_."
+
+
+def encode_cmd(cmd: str) -> str:
+    """A command as the portal's own client would have put it on the wire."""
+    return quote(cmd, safe=CMD_SAFE)
+
+
+# Schemes a stream can actually be handed to ffmpeg on. An allowlist, where
+# extract_link deliberately accepts anything with '://': the two answer
+# different questions. What a portal *resolves* may be multicast on a scheme
+# nobody here has met, and refusing to play it would be worse than not
+# recognising it -- but a command the portal never resolved can also be one of
+# its own internal pseudo-URLs ('ffrt4://ch/live/1'), which parses like an
+# address and plays as nothing.
+PLAYABLE_SCHEMES = frozenset(
+    {"http", "https", "udp", "rtp", "rtsp", "rtmp", "rtmps", "srt", "mms"}
+)
+
+
+def _is_portal_local(host: str) -> bool:
+    """Whether a host can only mean the machine that wrote the address.
+
+    'ffrt3 http://localhost/ch/1234_' is an instruction to the portal, never an
+    address a set-top box could open, so a channel carrying one always needs
+    resolving whatever its flags say. Rather more spellings than the obvious
+    one: RFC 6761 reserves every name ending in '.localhost' as well, IPv4
+    gives the whole of 127.0.0.0/8 to loopback, and a portal that writes its
+    own address as an IPv4-mapped IPv6 literal has said the same thing again.
+
+    A host that cannot be read at all counts as local, because the question
+    this answers is "may this be played without asking the portal", and the
+    only safe answer about an address nobody understands is no.
+    """
+    host = (host or "").strip().strip("[]").rstrip(".").lower()
+    if not host:
+        return True
+    if host == "localhost" or host.endswith(".localhost"):
+        return True
+    if host == "localhost.localdomain":
+        return True
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        # A name, and not one of the reserved loopback ones.
+        return False
+    mapped = getattr(address, "ipv4_mapped", None)
+    if mapped is not None:
+        address = mapped
+    return address.is_loopback or address.is_unspecified
+
+
+def portal_flag(value: Any) -> Optional[bool]:
+    """A portal's 1/0 flag, or None when the portal did not set one.
+
+    None is not False, and the difference is the whole of it: a row carrying
+    neither flag is a row the portal said nothing about, and silence has to
+    read as "no evidence" rather than "no". Portals write these as 1/0, as
+    "1"/"0", and occasionally as real booleans.
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if not text:
+        return None
+    return text not in ("0", "false", "no", "off")
+
+
+def plays_without_create_link(cmd: str, needs_link: Optional[bool]) -> bool:
+    """Whether this channel can be played from its command alone.
+
+    The portal's own player.js asks create_link for a channel only when the row
+    asks for it -- because the portal proxies it through a per-session link
+    ('use_http_tmp_link') or picks a storage server per request
+    ('use_load_balancing'). Every other row plays the command the listing
+    already handed over. pvr.stalker does the same and cites that line of
+    player.js for it (ChannelManager::GetStreamURL); iptvnator does the same
+    again, with guards it added for portals that are not Ministra.
+
+    Those guards are here too, and every one of them can only ever push a row
+    back onto the create_link path that exists today -- so none of them is able
+    to break a portal that works now:
+
+    * the portal has to have answered the question at all. Every portal synced
+      before this was read carries no flags, and taking that silence as a "no"
+      would move all of them onto the static path at once.
+    * the command has to contain a URL. 'auto /media/file.mpg' does not, and
+      only create_link turns that into an address.
+    * on a scheme ffmpeg can open -- see PLAYABLE_SCHEMES.
+    * not on a host that can only mean the portal itself.
+
+    The last condition is ours rather than anyone's reference behaviour, and it
+    is what makes this safe in a resolver rather than in a player: the command
+    must carry **no query string**. A link that expires keeps its token there,
+    and the cost of being wrong is not a retry -- by the time a stream fails
+    the resolver has already become ffmpeg, and Dispatcharr has spent this
+    channel's failover on a source that resolved perfectly well. A command with
+    no query has nothing in it that can go stale.
+    """
+    if needs_link is not False:
+        return False
+
+    link = extract_link(cmd)
+    if not link:
+        return False
+
+    parsed = urlparse(link)
+    if parsed.scheme.lower() not in PLAYABLE_SCHEMES:
+        return False
+    if parsed.query:
+        return False
+    return not _is_portal_local(parsed.hostname or "")
+
+
 def slugify(value: str) -> str:
     """Reduce a display name to something safe for URLs, keys and filenames."""
     slug = re.sub(r"[^a-z0-9]+", "-", value.strip().lower()).strip("-")
@@ -478,16 +739,75 @@ _EXPIRY_FORMATS = (
 
 
 def parse_expiry(value: Any) -> Optional[datetime]:
-    """Read a subscription expiry out of a free-text portal field."""
+    """Read a subscription expiry out of whatever field carried it.
+
+    Two shapes, because the two places it is found do not agree. get_main_info
+    holds free text a reseller typed; the profile's own account_info block
+    holds a Unix timestamp, which is also how a portal writes "never" -- 0 and
+    -1 both mean no expiry, and reading either as a date would report every
+    unlimited account as having run out in 1970.
+    """
     text = str(value or "").strip()
     if not text or text.startswith("0000-00-00"):
         return None
+
+    if re.fullmatch(r"-?\d+", text):
+        seconds = int(text)
+        if seconds <= 0:
+            return None
+        # Past the year 3000 in seconds is a value that was meant as
+        # milliseconds; portals send both.
+        if seconds > 32503680000:
+            seconds //= 1000
+        try:
+            return datetime.fromtimestamp(seconds, timezone.utc)
+        except (OverflowError, OSError, ValueError):
+            return None
+
     for fmt in _EXPIRY_FORMATS:
         try:
             return datetime.strptime(text, fmt).replace(tzinfo=timezone.utc)
         except ValueError:
             continue
     return None
+
+
+def prehash(mac: str) -> str:
+    """The SHA1 a client presents itself with, derived from the MAC it uses.
+
+    Neither the stock middleware nor any portal met so far reads this. It is
+    there for the optional access_filter.php a reseller can install in front of
+    it, which is also the reason a box that sends nothing at all is the shape
+    some of those filters reject.
+
+    What to send is written down nowhere. iptvnator computes the SHA1 of the
+    upper-case MAC; QiTV ships one constant for every install it has ever run.
+    Only the first says something true about this box, so it is the one copied
+    here -- and if a portal ever checks it against its own record, a constant
+    shared by every user of one client is the version that fails.
+    """
+    return hashlib.sha1(mac.upper().encode("utf-8")).hexdigest().upper()
+
+
+# Portals put markup in the sentence they refuse with -- "Your STB is
+# damaged.<br/> Call the provider." is a stock one -- and it lands in a
+# Dispatcharr notification, where a tag is noise at best.
+_MARKUP = re.compile(r"<[^>]*>")
+
+# Phrasings for the one refusal a user can act on: the portal has this MAC
+# bound to a device id that is not the one being sent. Kept to the binding
+# itself, because 'device' alone turns up in refusals with no remedy at all
+# ("device limit reached"), and labelling one of those would hand the user a
+# fix that cannot work. Safe as a phrase set where the raw-body patterns are
+# not: this is a field the middleware wrote, not an arbitrary document.
+DEVICE_CONFLICT = (
+    re.compile(r"device\s*conflict", re.I),
+    re.compile(
+        r"device[\s_-]?id[^.!?]{0,40}?"
+        r"(mismatch|conflict|does\s*not\s*match|not\s*match)",
+        re.I,
+    ),
+)
 
 
 def normalize_mac(mac: str) -> str:
@@ -758,53 +1078,303 @@ def normalize_portal_url(url: str) -> str:
     path = parsed.path
     lower = path.lower()
 
-    if lower.endswith(("/portal.php", "/load.php")):
-        pass  # explicit endpoint: leave exactly as given
+    if lower.endswith(".php"):
+        # An explicit endpoint, left exactly as given -- including a path no
+        # standard install serves. This is the one departure from stalkerhek,
+        # which swaps any other .php for portal.php in the same directory:
+        # panels living under a path of their own do exist, that path is the
+        # address the provider handed out, and replacing it with a guess is how
+        # the one URL known to work stops being tried at all.
+        # endpoint_candidates() probes the standard siblings after it anyway,
+        # so nothing is lost by trusting what was pasted first.
+        pass
     elif path in ("", "/"):
         path = "/portal.php"
-    elif lower.endswith(".php"):
-        # Some other .php file: swap in portal.php from the same directory.
-        directory = path.rsplit("/", 1)[0]
-        path = f"{directory}/portal.php"
     else:
         path = path.rstrip("/") + "/portal.php"
 
     return parsed._replace(path=path).geturl()
 
 
-def alternate_endpoint(url: str) -> str:
-    """The other place a Stalker API lives, or '' when there isn't one.
+# -- redaction --------------------------------------------------------------
+#
+# The Portals box was the one place a subscription's credentials were rendered
+# back to whoever opened the page, and Dispatcharr serves a plugin's settings
+# row to every account on the install. So the row keeps a redacted rendering of
+# the list, and the real one lives only in the registry file, which the panel
+# cannot reach -- see registry.py.
+#
+# What this buys is that the credentials are no longer on the screen or in the
+# API response. It is not encryption at rest and must not be sold as such: the
+# resolver reads the MAC on every tune, in a process with no Django, so
+# portals.txt and the state mirrors go on holding it in the clear at 0600.
 
-    Ministra answers on two paths and installs differ in which they expose:
-    ``<base>/c/portal.php``, which is what :func:`normalize_portal_url` builds
-    and what most providers hand out, and ``<base>/server/load.php``, which is
-    the older canonical one and the only one pvr.stalker has ever asked for.
-    A portal serving just one of them used to be unusable if the user had been
-    given the other, with a 404 and nothing to suggest.
+# U+2022, because the token has to be something no URL, MAC or key=value could
+# be, and something nobody types into the box by accident. An ASCII '****' is a
+# perfectly plausible password.
+MASK = "•" * 4
 
-    The mapping is pvr.stalker's, read backwards as well as forwards::
+# Redacted wherever they appear as key=value. The MAC is redacted too, but it
+# is positional and handled apart. The rule is what a value *proves* rather
+# than what it configures: anything a stranger could authenticate with is
+# hidden, while model, timezone, max_streams and the epg switches stay
+# readable -- they tune behaviour, and they are what lets a user recognise
+# their own line.
+SECRET_KEYS = ("username", "password", "device_id", "device_id2",
+               "serial", "signature")
 
-        http://h/c/portal.php                -> http://h/server/load.php
-        http://h/stalker_portal/c/portal.php -> http://h/stalker_portal/server/load.php
-        http://h/server/load.php             -> http://h/c/portal.php
+
+def is_masked(text: Optional[str]) -> bool:
+    """True if a portal list carries redacted values rather than real ones."""
+    return MASK in (text or "")
+
+
+def _line_body(line: str) -> Tuple[bool, str]:
+    """Separate a line's comment marker from the portal line inside it.
+
+    A '#' line is how the help text tells users to suspend a portal without
+    losing its channels, so it holds a real MAC and has to be redacted like any
+    other -- and put back together the same way.
+    """
+    stripped = line.strip()
+    if stripped.startswith("#"):
+        return True, stripped.lstrip("#").strip()
+    return False, stripped
+
+
+def _mac_index(parts: List[str]) -> int:
+    """Which '|' field holds the MAC, by split_portal_line's own rule.
+
+    The token counts as a MAC here. Without that, redacting the MAC would move
+    the fields of an unnamed line: 'url | MAC | extras' reads correctly only
+    because the second field looks like a MAC, and 'url | <token> | extras'
+    would otherwise be read as name, url and MAC.
+    """
+    if len(parts) >= 3 and not (
+        MAC_RE.match(normalize_mac(parts[1])) or parts[1].strip() == MASK
+    ):
+        return 2
+    return 1
+
+
+def _line_slug(line: str) -> str:
+    """The slug a portal line is filed under, tolerating a redacted MAC.
+
+    This is what pairs a redacted line back up with the real one it was made
+    from, so the two have to agree even though one of them no longer has a MAC.
+    """
+    parts = [p.strip() for p in _line_body(line)[1].split("|")]
+    if len(parts) < 2:
+        return ""
+    at = _mac_index(parts)
+    name = parts[0] if at == 2 else ""
+    return slugify(name or name_from_url(parts[at - 1]))
+
+
+def _mask_extras(segment: str) -> str:
+    """Redact the secrets among one segment's key=value pairs."""
+    try:
+        tokens = shlex.split(segment)
+    except ValueError:
+        return segment
+    out = []
+    for token in tokens:
+        key, sep, value = token.partition("=")
+        if not sep:
+            out.append(token)
+        elif value and key.strip().lower() in SECRET_KEYS:
+            out.append(f"{key}={MASK}")
+        else:
+            out.append(f"{key}={_quote_if_needed(value)}")
+    return " ".join(out)
+
+
+def _unmask_extras(segment: str, extras: Dict[str, str]) -> str:
+    """Put the secrets back into one segment's key=value pairs."""
+    if MASK not in segment:
+        return segment
+    try:
+        tokens = shlex.split(segment)
+    except ValueError:
+        return segment
+    out = []
+    for token in tokens:
+        key, sep, value = token.partition("=")
+        if sep and value.strip() == MASK:
+            restored = extras.get(key.strip().lower(), "")
+            # Nothing to restore leaves the token standing: see unmask_portals.
+            out.append(f"{key}={_quote_if_needed(restored)}" if restored
+                       else f"{key}={MASK}")
+        elif sep:
+            out.append(f"{key}={_quote_if_needed(value)}")
+        else:
+            out.append(token)
+    return " ".join(out)
+
+
+def mask_portals(text: str) -> str:
+    """Render a portal list with every credential replaced by :data:`MASK`.
+
+    Everything that is not a credential survives -- names, URLs, comments, the
+    tuning keys -- so the box still reads as the user's own configuration, and
+    a portal is still deleted by deleting its line.
+
+    The name is written out even where the line derived it from the URL: it is
+    the identity :func:`unmask_portals` pairs the line back up by, and writing
+    it also settles where the MAC was once the MAC is gone.
+    """
+    out = []
+    for raw in text.splitlines():
+        commented, body = _line_body(raw)
+        if not body:
+            out.append(raw)
+            continue
+
+        parsed, _ = split_portal_line(body)
+        if parsed is None:
+            # A line that does not parse holds no credential we could find, and
+            # the user has to go on seeing it to be able to fix it.
+            out.append(raw)
+            continue
+
+        parts = [p.strip() for p in body.split("|")]
+        at = _mac_index(parts)
+        parts[at] = MASK
+        parts[at + 1:] = [_mask_extras(part) for part in parts[at + 1:]]
+        if at == 1:
+            parts.insert(0, parsed["name"])
+        # format_portal_line() always writes an extras field, empty or not.
+        while len(parts) > 3 and not parts[-1]:
+            parts.pop()
+
+        line = " | ".join(parts)
+        out.append(f"# {line}" if commented else line)
+
+    return "\n".join(out) + ("\n" if text.endswith("\n") else "")
+
+
+def unmask_portals(text: str, stored: str) -> str:
+    """Put the credentials back into a list the panel sent back redacted.
+
+    ``stored`` is the registry's copy, the only place the real values exist.
+    Lines are paired with it by slug, and failing that by URL: renaming a
+    portal and moving one are both ordinary edits, and either would otherwise
+    orphan the line's own MAC. A line typed out in full carries no token and is
+    returned exactly as typed, so pasting a list back in still works.
+
+    A token nothing matches is left standing rather than resolved to an empty
+    value: Plugin._portals refuses a list that still holds one and says which
+    line to retype, which is a great deal easier to act on than a portal
+    quietly authenticating with nothing.
+    """
+    if not is_masked(text):
+        return text
+
+    records = []
+    for raw in (stored or "").splitlines():
+        body = _line_body(raw)[1]
+        if not body:
+            continue
+        parsed, _ = split_portal_line(body)
+        if parsed is None:
+            continue
+        records.append({
+            "slug": _line_slug(body),
+            "url": normalize_portal_url(parsed["url"]),
+            "parsed": parsed,
+            "used": False,
+        })
+
+    def take(slug: str, url: str) -> Optional[Dict[str, Any]]:
+        """The stored line this redacted one came from, consumed once.
+
+        Consumed, because a suspended line and its replacement can share both
+        slug and host -- that is what commenting a line out is for -- and the
+        second of them must not be handed the first one's credentials.
+        """
+        for field, wanted in (("slug", slug), ("url", url)):
+            if not wanted:
+                continue
+            for record in records:
+                if not record["used"] and record[field] == wanted:
+                    record["used"] = True
+                    return record["parsed"]
+        return None
+
+    out = []
+    for raw in text.splitlines():
+        commented, body = _line_body(raw)
+        if MASK not in body:
+            out.append(raw)
+            continue
+
+        parts = [p.strip() for p in body.split("|")]
+        at = _mac_index(parts)
+        source = take(_line_slug(body), normalize_portal_url(parts[at - 1]))
+        if source is not None:
+            if parts[at] == MASK:
+                parts[at] = source["mac"]
+            parts[at + 1:] = [
+                _unmask_extras(part, source["extras"]) for part in parts[at + 1:]
+            ]
+
+        line = " | ".join(parts)
+        out.append(f"# {line}" if commented else line)
+
+    return "\n".join(out) + ("\n" if text.endswith("\n") else "")
+
+
+def endpoint_candidates(url: str) -> List[str]:
+    """Where a Stalker API might answer for this URL, best guess first.
+
+    The endpoint cannot be worked out from what a user pastes. Ministra serves
+    ``<base>/stalker_portal/server/load.php`` and shows its interface at
+    ``<base>/stalker_portal/c/``; reseller panels serve ``<base>/c/portal.php``
+    or ``<base>/portal.php``, and some serve neither, from a path of their own.
+    pvr.stalker knows the first pair and stalkerhek the second. No client knows
+    all of them, which is why this is a list to probe rather than a mapping to
+    apply.
+
+    The configured URL always comes first, and the second entry is still what
+    :func:`alternate_endpoint` used to be the whole of -- the pvr.stalker
+    mapping, read both ways. The rest are added after it, so a portal that was
+    found on the second try before is found on the second try still.
+
+    The siblings are built from the install root: the configured directory with
+    a trailing ``/c`` or ``/server`` taken off, because both of those are the
+    API's own subdirectory rather than part of where the install lives.
     """
     parsed = urlparse(url)
-    path = parsed.path
-    directory, _, filename = path.rpartition("/")
-    filename = filename.lower()
+    directory, _, filename = parsed.path.rpartition("/")
+    if not filename.lower().endswith(".php"):
+        # Not an endpoint at all: read the whole path as the directory rather
+        # than throwing away its last segment.
+        directory = parsed.path
 
-    if filename == "portal.php":
-        base = directory[:-2] if directory.lower().endswith("/c") else directory
-        new_path = base + "/server/load.php"
-    elif filename == "load.php":
-        base = directory[:-7] if directory.lower().endswith("/server") else directory
-        new_path = base + "/c/portal.php"
-    else:
-        return ""
+    base = directory.rstrip("/")
+    for own in ("/c", "/server"):
+        if base.lower().endswith(own):
+            base = base[: -len(own)]
+            break
 
-    if new_path == path:
-        return ""
-    return parsed._replace(path=new_path).geturl()
+    paths = [
+        parsed.path,
+        # The pvr.stalker pair, which is what this list grew out of.
+        base + "/server/load.php",
+        base + "/c/portal.php",
+        base + "/portal.php",
+    ]
+    # Already the canonical form when the base ends there -- nesting it again
+    # would probe a path no server has.
+    if "/stalker_portal" not in base.lower():
+        paths.append(base + "/stalker_portal/server/load.php")
+
+    candidates: List[str] = []
+    for path in paths:
+        candidate = parsed._replace(path=path).geturl()
+        if candidate not in candidates:
+            candidates.append(candidate)
+    return candidates
 
 
 # ---------------------------------------------------------------------------
@@ -989,6 +1559,80 @@ def load_portal(slug: str, client=None) -> Optional[PortalConfig]:
     return cfg
 
 
+def _static_key(slug: str) -> str:
+    return f"{REDIS_PREFIX}:static:{slug}"
+
+
+def _static_mirror(slug: str) -> str:
+    return f"static-{slug}"
+
+
+def static_commands(channels: List["ChannelEntry"]) -> List[str]:
+    """The commands the resolver may play without asking the portal first."""
+    return sorted(
+        {
+            channel.cmd
+            for channel in channels
+            if plays_without_create_link(channel.cmd, channel.needs_link)
+        }
+    )
+
+
+def save_static_cmds(slug: str, commands: List[str], client=None) -> None:
+    """Publish the commands that need no create_link, for the resolver to read.
+
+    Written on every sync including when it is empty, which is what nearly
+    every portal produces -- and what a portal that has *stopped* marking its
+    channels static has to leave behind, rather than inheriting the last list
+    that said otherwise.
+
+    Mirrored first, like the portal itself: if Redis refuses, the sync says so
+    and the resolver still reads the right thing off disk.
+    """
+    payload = list(commands)
+    _mirror_write(_static_mirror(slug), payload)
+    client = client or get_redis()
+    client.set(_static_key(slug), json.dumps(payload))
+
+
+def load_static_cmds(slug: str, client=None) -> set:
+    """The same set back, or an empty one.
+
+    Every path out of here that is not a list lands on the empty set, and that
+    is deliberate rather than lazy: not knowing whether a channel is static has
+    exactly one safe reading, and it is asking the portal -- which is what this
+    plugin did before any of this existed.
+    """
+    client = _client_or_none(client)
+
+    raw = None
+    if client is not None:
+        try:
+            raw = client.get(_static_key(slug))
+        except Exception:
+            raw = None
+    if raw:
+        try:
+            payload = json.loads(raw)
+        except (ValueError, TypeError):
+            payload = None
+        if isinstance(payload, list):
+            return {str(item) for item in payload}
+
+    payload = _mirror_read(_static_mirror(slug))
+    if not isinstance(payload, list):
+        return set()
+
+    # Put it back, so a wiped Redis costs a file read once rather than once
+    # per tune -- the same bargain load_portal makes.
+    if client is not None:
+        try:
+            client.set(_static_key(slug), json.dumps(payload))
+        except Exception:
+            pass
+    return {str(item) for item in payload}
+
+
 def _sync_lock_key() -> str:
     return f"{REDIS_PREFIX}:sync-lock"
 
@@ -1127,8 +1771,9 @@ def published_slugs() -> List[str]:
 
 def forget_portal(slug: str, client=None) -> None:
     _mirror_forget(_portal_mirror(slug))
+    _mirror_forget(_static_mirror(slug))
     client = client or get_redis()
-    client.delete(_portal_key(slug), _token_key(slug))
+    client.delete(_portal_key(slug), _token_key(slug), _static_key(slug))
 
 
 def _fallback_key() -> str:
@@ -1243,6 +1888,10 @@ class ChannelEntry:
     # canonical_cmd. Counted rather than logged per channel, because on the
     # portal that prompted it, 647 of them arrived at once.
     cmd_rewritten: bool = False
+    # Whether the portal says this channel needs a link minted for it before it
+    # can be played. None when the row carried neither flag, which is not the
+    # same as False -- see portal_flag and plays_without_create_link.
+    needs_link: Optional[bool] = None
 
 
 class Portal:
@@ -1284,6 +1933,10 @@ class Portal:
         # Whether the portal said the token it handed back is already good for
         # more than the handshake. Reported straight back to it in get_profile.
         self.valid_token = False
+        # The nonce the handshake handed back, echoed in get_profile's metrics.
+        # A portal that issues one and never sees it again is being talked to
+        # by something that did not read its own handshake.
+        self.handshake_random = ""
         # What get_profile answered during login(), kept so nothing has to ask
         # twice: the expiry report and the blocked flag both read it.
         self.profile: Dict[str, Any] = {}
@@ -1384,30 +2037,45 @@ class Portal:
             raise PortalError(message)
 
         try:
-            return resp.json()
+            payload = resp.json()
         except ValueError:
-            snippet = (resp.text or "").strip()[:300]
+            # Classified on the whole body and displayed truncated: the
+            # patterns are anchored, so cutting first could only ever hide a
+            # refusal, never invent one.
+            body = (resp.text or "").strip()
             # A dead session is answered in plain text with a 200 attached, so
             # it arrives here rather than as an HTTP error. Saying so is what
             # lets the resolver re-authenticate instead of failing the tune.
-            if snippet.lower() == AUTH_FAILED_BODY:
-                raise PortalAuthError("portal says the session is no longer authorised")
+            refusal = auth_refusal(body)
+            if refusal:
+                raise PortalAuthError(refusal)
             # Anything else that is not JSON is an HTML error page, a login
             # form, or a landing page: something is listening, but it is not a
             # Stalker API, so the other endpoint is worth a try.
-            raise PortalEndpointError(f"portal returned non-JSON response: {snippet}")
+            raise PortalEndpointError(
+                f"portal returned non-JSON response: {body[:300]}"
+            )
+
+        # A refusal can also arrive as perfectly good JSON, and then it is not
+        # this reply that is unusable but the session behind it.
+        refusal = envelope_refusal(payload)
+        if refusal:
+            raise PortalAuthError(refusal)
+        return payload
 
     # -- authentication ---------------------------------------------------
 
     def handshake(self) -> str:
         """Reserve a token. The portal may hand back a different one."""
         data = self._get_json(
-            f"type=stb&action=handshake&token={self.token}&JsHttpRequest=1-xml",
+            f"type=stb&action=handshake&token={self.token}"
+            f"&prehash={prehash(self.cfg.mac)}&JsHttpRequest=1-xml",
             with_auth=False,
         )
         js = data.get("js") if isinstance(data, dict) else None
         if isinstance(js, dict) and js.get("token"):
             self.token = str(js["token"])
+            self.handshake_random = str(js.get("random") or "")
             # 'not_valid' is the portal saying the token still has to be
             # earned. get_profile is told the same thing back, which is how it
             # knows whether it is being asked to validate or merely to report.
@@ -1466,12 +2134,35 @@ class Portal:
             f"&device_id={quote(self.cfg.device_id)}"
             f"&device_id2={quote(self.cfg.device_id2)}"
             f"&signature={quote(self.cfg.signature)}"
+            f"&client_type=STB&video_out=hdmi"
+            f"&metrics={quote(self._metrics())}"
+            f"&prehash={prehash(self.cfg.mac)}"
             f"&not_valid_token={0 if self.valid_token else 1}"
             f"&auth_second_step={1 if auth_second_step else 0}"
         )
         data = self._get_json(query)
         js = data.get("js") if isinstance(data, dict) else None
         return js if isinstance(js, dict) else {}
+
+    def _metrics(self) -> str:
+        """The box describing itself, in the shape get_profile wants it.
+
+        A JSON blob rather than parameters, which is Ministra's choice and not
+        ours. It is what the admin panel stores and shows the reseller, so a
+        portal whose operator looks at their device list sees a MAG rather than
+        a blank row -- and the filters that reject a box reporting nothing read
+        this too.
+        """
+        return json.dumps(
+            {
+                "mac": self.cfg.mac,
+                "sn": self.cfg.serial_number,
+                "model": self.cfg.model,
+                "type": "STB",
+                "random": self.handshake_random,
+            },
+            separators=(",", ":"),
+        )
 
     # What get_profile's 'status' means. The portal decides which authentication
     # this account needs and says so here, rather than the client guessing from
@@ -1508,7 +2199,7 @@ class Portal:
           explicit refusal (:class:`PortalAuthError`) is still fatal, because
           that is the portal answering rather than failing to.
         """
-        self._handshake_on_either_endpoint()
+        self._handshake_on_any_endpoint()
 
         try:
             self.profile = self.get_profile()
@@ -1544,46 +2235,53 @@ class Portal:
 
         return self.token
 
-    def _handshake_on_either_endpoint(self) -> None:
-        """Shake hands, trying the portal's other API path if this one is not it.
+    def _handshake_on_any_endpoint(self) -> None:
+        """Shake hands, walking the portal's other API paths if this one is not it.
 
         The handshake is every session's first request, so a portal reached at
         the wrong path fails here and nowhere later -- which makes this the one
-        place worth spending an extra round-trip on.
+        place worth spending extra round-trips on.
 
-        Only a :class:`PortalEndpointError` earns that second try: a 404, or an
-        answer that is not JSON. A portal that is unreachable, unwell or
-        refusing the MAC would answer identically on both paths, and at tune
-        time a wasted round-trip is time Dispatcharr is not yet spending on the
-        next source.
+        Only a :class:`PortalEndpointError` moves to the next candidate: a 404,
+        or an answer that is not JSON. A portal that is unreachable, unwell or
+        refusing the MAC would answer identically on every path -- they all
+        live on the same host -- and at tune time a wasted round-trip is time
+        Dispatcharr is not yet spending on the next source. That is also why
+        the list is only walked when the user's URL is wrong, which is a
+        setup-time mistake rather than something that happens mid-service.
 
         The swap lasts for this session only. Nothing is written back, so the
         cost is one failed request per sync and per token expiry -- small, and
         the warning tells the user how to stop paying it for good.
         """
-        try:
-            self.handshake()
-            return
-        except PortalEndpointError as exc:
-            alternate = alternate_endpoint(self.url)
-            if not alternate:
+        first_failure: Optional[PortalError] = None
+
+        for candidate in endpoint_candidates(self.url):
+            self.url = candidate
+            try:
+                self.handshake()
+            except PortalEndpointError as exc:
+                if first_failure is None:
+                    first_failure = exc
+                continue
+            except PortalError:
+                # Not a statement about the path, so no other path can help.
+                self.url = self.cfg.url
                 raise
-            first_failure = exc
 
-        self.url = alternate
-        try:
-            self.handshake()
-        except PortalError:
-            # The other path is no better. Report the original failure: it is
-            # the one about the URL the user actually configured.
-            self.url = self.cfg.url
-            raise first_failure
+            if candidate != self.cfg.url:
+                self.warnings.append(
+                    f"the portal does not answer at {self.cfg.url} "
+                    f"({first_failure}), but does at {candidate}; put that on "
+                    "its portal line to save a failed request on every sync"
+                )
+            return
 
-        self.warnings.append(
-            f"the portal does not answer at {self.cfg.url} ({first_failure}), "
-            f"but does at {alternate}; put that on its portal line to save a "
-            "failed request on every sync"
-        )
+        # Every path was answered by something that was not a Stalker API.
+        # Report the first failure: it is the one about the URL the user
+        # actually configured.
+        self.url = self.cfg.url
+        raise first_failure
 
     @staticmethod
     def _profile_status(profile: Dict[str, Any]) -> int:
@@ -1601,12 +2299,28 @@ class Portal:
         """The portal's own explanation, if it gave one.
 
         ``block_msg`` first: when both are set it is the specific one, and it
-        is what the reseller wrote for exactly this situation.
+        is what the reseller wrote for exactly this situation. Markup comes out
+        of it, because this ends up in a Dispatcharr notification and portals
+        write these with ``<br/>`` in them.
+
+        A device conflict gets a sentence added. It is the one refusal here
+        that the user can do something about, and the portal's own wording for
+        it names the device rather than the binding -- so the message arrives
+        describing a problem with the box instead of one with two settings on
+        the portal line.
         """
         for key in ("block_msg", "msg"):
-            value = str(profile.get(key) or "").strip()
-            if value:
-                return value
+            value = " ".join(_MARKUP.sub(" ", str(profile.get(key) or "")).split())
+            if not value:
+                continue
+            if any(pattern.search(value) for pattern in DEVICE_CONFLICT):
+                value += (
+                    " -- the portal has this MAC bound to a different device "
+                    "id; put the ones it expects on the portal line with "
+                    "'device_id=' and 'device_id2=', or ask the provider to "
+                    "clear the binding"
+                )
+            return value
         return ""
 
     def account_snapshot(self) -> Dict[str, Any]:
@@ -1636,14 +2350,30 @@ class Portal:
         """
         snapshot: Dict[str, Any] = {"expires": None, "blocked": False}
 
-        try:
-            js = self._get_json(
-                "type=account_info&action=get_main_info&JsHttpRequest=1-xml"
-            ).get("js")
-            if isinstance(js, dict):
-                snapshot["expires"] = parse_expiry(js.get("phone"))
-        except Exception:
-            pass
+        # The profile login() already read comes first, and costs nothing:
+        # 'account_info' is where Ministra itself puts the date, as a Unix
+        # timestamp. A portal that answered there is not asked again.
+        info = self.profile.get("account_info")
+        if isinstance(info, dict):
+            snapshot["expires"] = parse_expiry(info.get("expire_date"))
+
+        if snapshot["expires"] is None:
+            try:
+                js = self._get_json(
+                    "type=account_info&action=get_main_info&JsHttpRequest=1-xml"
+                ).get("js")
+                if isinstance(js, dict):
+                    # 'phone' last: it is where the date ends up on the portals
+                    # this plugin actually meets, but it is a free-text field
+                    # and the three named ones mean only this when present.
+                    for field in ("expire_date", "end_date",
+                                  "expire_billing_date", "phone"):
+                        found = parse_expiry(js.get(field))
+                        if found:
+                            snapshot["expires"] = found
+                            break
+            except Exception:
+                pass
 
         snapshot["blocked"] = str(self.profile.get("blocked") or "0") not in ("0", "")
 
@@ -1688,10 +2418,21 @@ class Portal:
             )
 
         channels: List[ChannelEntry] = []
+        seen = set()
         for row in rows:
             channel = self._channel_from_row(row)
-            if channel is not None:
-                channels.append(channel)
+            if channel is None:
+                continue
+            # Portals do repeat a channel in this response, and a duplicate is
+            # not a harmless extra row: Dispatcharr hashes a stream partly on
+            # its URL, so it becomes a second stream for one channel. Keyed the
+            # way the paged path keys it -- the id when there is one, the
+            # command when there is not.
+            key = channel.channel_id or channel.cmd
+            if key in seen:
+                continue
+            seen.add(key)
+            channels.append(channel)
         return channels
 
     @staticmethod
@@ -1711,6 +2452,16 @@ class Portal:
         channel_id = str(row.get("id") or "")
         marker = canonical_cmd(cmd, channel_id)
 
+        # Two flags, one answer: either of them set means the portal mints the
+        # link. A row carrying neither has not answered, and None says so.
+        tmp_link = portal_flag(row.get("use_http_tmp_link"))
+        balanced = portal_flag(row.get("use_load_balancing"))
+        needs_link = (
+            None
+            if tmp_link is None and balanced is None
+            else bool(tmp_link) or bool(balanced)
+        )
+
         return ChannelEntry(
             channel_id=channel_id,
             name=name,
@@ -1722,6 +2473,7 @@ class Portal:
             # Portals write these as 1/0, and sometimes as "1"/"0".
             tv_archive=str(row.get("enable_tv_archive") or "0") not in ("0", ""),
             tv_archive_duration=str(row.get("tv_archive_duration") or ""),
+            needs_link=needs_link,
         )
 
     def get_ordered_list(self, page: int) -> Dict[str, Any]:
@@ -1735,7 +2487,14 @@ class Portal:
         """
         data = self._get_json(
             "type=itv&action=get_ordered_list&JsHttpRequest=1-xml"
-            f"&genre=*&fav=0&sortby=number&p={int(page)}"
+            # 'category' says the same thing as 'genre' to the portals that
+            # read that one instead, 'force_ch_link_check' is sent empty by
+            # every client that sends it at all, and 'hd' asks for the whole
+            # line-up rather than the HD half of it. None of the three changes
+            # what a Ministra portal answers; each of them is what one of the
+            # other clients found a portal that wanted it.
+            f"&genre=*&category=*&fav=0&force_ch_link_check=&hd=0"
+            f"&sortby=number&p={int(page)}"
         )
         js = data.get("js") if isinstance(data, dict) else None
         return js if isinstance(js, dict) else {}
@@ -1942,7 +2701,14 @@ class Portal:
         without it -- see :func:`stream_id`. Only ever sent with a value, so a
         portal that never asked for it sees the request it has always seen.
         """
-        query = f"action=create_link&type=itv&cmd={quote(cmd, safe='')}"
+        query = (
+            "action=create_link&type=itv"
+            f"&cmd={encode_cmd(cmd)}"
+            # What the portal's own player.js sends beside the command. Neither
+            # changes what a live channel answers; both are what a portal
+            # expecting its own client sees on every request except ours.
+            "&disable_ad=0&download=0"
+        )
         channel = stream_id(cmd)
         if channel:
             query += f"&stream={quote(channel, safe='')}"

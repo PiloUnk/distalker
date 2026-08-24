@@ -93,7 +93,9 @@ def test_absent_key_means_clobbered_and_is_restored():
     result = p._reconcile_registry(merged, NullLogger())
 
     assert result["portals"] == PORTAL, "the clobbered list must come back"
-    assert store["settings"]["portals"] == PORTAL, "and be written back to the DB"
+    assert store["settings"]["portals"] == s.mask_portals(PORTAL), (
+        "and be written back to the DB, redacted -- the row is what the API serves"
+    )
     portals, errors = s.parse_portals(result["portals"])
     assert not errors and [x.name for x in portals] == ["livingroom"]
 
@@ -245,6 +247,134 @@ def test_a_marker_left_over_from_an_outside_edit_is_ignored():
     # Someone edits the file directly, or restores a backup.
     registry.save_registry(PORTAL + "# a note\n")
     assert not registry.is_pending(), "the marker no longer describes the file"
+
+
+# -- redaction: the row the API serves is not the list the plugin works from --
+
+def test_the_settings_row_never_holds_a_credential():
+    """Dispatcharr serves the settings row to every account on the install, and
+    the panel paints it into a textarea. Neither is a place for a MAC."""
+    reset()
+    p, store = make_plugin({})
+    p._save_settings({"portals": PORTAL})
+
+    assert "00:1A:79:AA:BB:CC" not in store["settings"]["portals"]
+    assert s.is_masked(store["settings"]["portals"])
+    assert registry.load_registry() == PORTAL, "the file keeps the real thing"
+
+
+def test_the_panel_sending_the_redaction_back_changes_nothing():
+    """The panel can only return what it was shown. That must read as 'no
+    change', not as the user having replaced every MAC with bullets."""
+    reset()
+    registry.save_registry(PORTAL)
+    masked = s.mask_portals(PORTAL)
+
+    p, _ = make_plugin({"portals": masked})
+    result = p._reconcile_registry({"portals": masked}, NullLogger())
+
+    assert result["portals"] == PORTAL, "handlers must be given the real list"
+    assert registry.load_registry() == PORTAL, "and the file must be untouched"
+    assert not registry.is_pending(), "the panel is in step with the file"
+
+
+def test_reopening_the_panel_does_not_rewrite_the_file():
+    """A line that never named its portal comes back from the redaction with
+    the derived name written out, because that is what makes the MAC's position
+    findable. That is the rendering's doing, not an edit, and reading it as one
+    would rewrite the user's file on every click."""
+    reset()
+    unnamed = "http://portal.example/c/ | 00:1A:79:AA:BB:CC | epg=1\n"
+    registry.save_registry(unnamed)
+    shown = s.mask_portals(unnamed)
+    assert shown.startswith("portal | "), "the derived name is written out"
+
+    p, _ = make_plugin({"portals": shown})
+    result = p._reconcile_registry({"portals": shown}, NullLogger())
+
+    assert result["portals"] == unnamed
+    assert registry.load_registry() == unnamed, "the file must be left alone"
+    assert not registry.is_pending()
+
+
+def test_an_edit_made_through_the_redaction_keeps_the_hidden_half():
+    """Changing a portal's URL while its MAC is hidden is the ordinary case,
+    and the MAC the user cannot see must survive it."""
+    reset()
+    registry.save_registry(PORTAL)
+
+    edited = s.mask_portals(PORTAL).replace("http://portal.example/c/",
+                                            "http://moved.example/c/")
+    p, store = make_plugin({"portals": edited})
+    result = p._reconcile_registry({"portals": edited}, NullLogger())
+
+    assert "http://moved.example/c/" in result["portals"], "the edit must stick"
+    assert "00:1A:79:AA:BB:CC" in result["portals"], "and the MAC must come back"
+    assert registry.load_registry() == result["portals"]
+    assert s.is_masked(store["settings"]["portals"]), "the row stays redacted"
+
+
+def test_an_upgrade_hides_credentials_the_row_already_holds():
+    """Installs coming from an earlier version have their MAC in the row. A
+    panel that only ever presses Sync never edits the box, so nothing else
+    would ever rewrite it."""
+    reset()
+    registry.save_registry(PORTAL)
+
+    p, store = make_plugin({"portals": PORTAL})       # as an older version left it
+    result = p._reconcile_registry({"portals": PORTAL}, NullLogger())
+
+    assert result["portals"] == PORTAL
+    assert s.is_masked(store["settings"]["portals"]), "the row must be redacted now"
+    assert registry.load_registry() == PORTAL
+
+
+def test_nothing_is_hidden_until_the_file_is_known_to_hold_it():
+    """Redacting is only safe once there are two copies. A registry that could
+    not be written leaves the row as the only one there is, and hiding the only
+    copy of a credential is how a configuration gets lost."""
+    reset()
+    original = plugin_mod.save_registry
+    plugin_mod.save_registry = lambda text, pending=False: False
+    try:
+        p, store = make_plugin({"portals": PORTAL})
+        result = p._reconcile_registry({"portals": PORTAL}, NullLogger())
+        assert result["portals"] == PORTAL
+        assert store["settings"]["portals"] == PORTAL, "still the only copy"
+    finally:
+        plugin_mod.save_registry = original
+
+
+def test_a_redaction_is_never_written_over_the_real_list():
+    """The panel holds bullets and the file that explains them is gone -- a
+    recreated volume, a partial restore. Adopting what the panel sends would
+    make the loss permanent by writing the bullets into the file."""
+    reset()
+    masked = s.mask_portals(PORTAL)
+
+    p, store = make_plugin({"portals": masked})
+    result = p._reconcile_registry({"portals": masked}, NullLogger())
+
+    assert s.is_masked(result["portals"]), "nothing can fill these back in"
+    assert registry.load_registry() is None, "and nothing may be written"
+    assert store["settings"]["portals"] == masked, "the row is left as it was"
+
+
+def test_a_line_that_could_not_be_filled_back_in_is_named_and_refused():
+    """Parsing on would report a MAC address made of bullets, which explains
+    nothing. The line itself is quoted back instead, because retyping it is
+    the only thing that fixes this."""
+    reset()
+    masked = s.mask_portals(PORTAL)
+    p, _ = make_plugin({})
+    try:
+        p._portals({"portals": masked})
+    except plugin_mod.PortalError as exc:   # plugin.py holds its own import
+        assert "livingroom" in str(exc), exc
+        assert registry.REGISTRY_PATH in str(exc), exc
+        assert "retype" in str(exc), exc
+    else:
+        raise AssertionError("a redacted list must not be parsed")
 
 
 if __name__ == "__main__":

@@ -167,6 +167,106 @@ def test_removing_a_portal_removes_its_mirror():
     assert s.load_portal(CFG.slug, client) is None
 
 
+STATIC_CMD = "http://prov.example/USER/PASS/1225691"
+
+
+def test_the_static_commands_survive_a_restart_too():
+    """A tune that read nothing would ask the portal, which is safe but is the
+    round trip this exists to avoid -- and on the providers concerned it is the
+    request that answers with a path returning 401."""
+    reset()
+    client = FakeRedis()
+    s.save_static_cmds(CFG.slug, [STATIC_CMD], client)
+    assert os.path.exists(s._state_path(f"static-{CFG.slug}"))
+
+    client.store.clear()
+    assert s.load_static_cmds(CFG.slug, client) == {STATIC_CMD}
+    assert s._static_key(CFG.slug) in client.store, "and it goes back in Redis"
+
+
+def test_not_knowing_means_asking_the_portal():
+    """The one safe reading of every failure here, and the behaviour that was
+    there before any of this existed."""
+    reset()
+    assert s.load_static_cmds("never-registered", FakeRedis()) == set()
+    assert s.load_static_cmds(CFG.slug, FakeRedis(broken=True)) == set()
+
+    client = FakeRedis()
+    s.save_static_cmds(CFG.slug, [STATIC_CMD], client)
+    client.store[s._static_key(CFG.slug)] = "{not json"
+    assert s.load_static_cmds(CFG.slug, client) == {STATIC_CMD}, "the mirror wins"
+
+
+def test_a_portal_that_stops_marking_channels_static_is_believed():
+    """Inheriting the last list that said otherwise would keep playing a
+    command the portal has since started minting links for."""
+    reset()
+    client = FakeRedis()
+    s.save_static_cmds(CFG.slug, [STATIC_CMD], client)
+    s.save_static_cmds(CFG.slug, [], client)
+    assert s.load_static_cmds(CFG.slug, client) == set()
+
+
+def test_removing_a_portal_removes_its_static_commands():
+    reset()
+    client = FakeRedis()
+    s.save_portal(CFG, client)
+    s.save_static_cmds(CFG.slug, [STATIC_CMD], client)
+    s.forget_portal(CFG.slug, client)
+
+    assert not os.path.exists(s._state_path(f"static-{CFG.slug}"))
+    assert s.load_static_cmds(CFG.slug, client) == set()
+
+
+def test_a_static_channel_never_reaches_the_portal():
+    """The whole point: no handshake, no create_link, no connection slot."""
+    reset()
+    client = FakeRedis()
+    s.save_portal(CFG, client)
+    s.save_static_cmds(CFG.slug, [STATIC_CMD], client)
+
+    class Unreachable(s.Portal):
+        def login(self):
+            raise AssertionError("a static channel must not contact the portal")
+
+        def create_link(self, cmd):
+            raise AssertionError("a static channel must not contact the portal")
+
+    original_portal, original_redis = s.Portal, s.get_redis
+    s.Portal, s.get_redis = Unreachable, lambda: client
+    try:
+        link, cfg, _ = resolver.resolve(CFG.slug, STATIC_CMD)
+    finally:
+        s.Portal, s.get_redis = original_portal, original_redis
+
+    assert link == STATIC_CMD
+    assert cfg.slug == CFG.slug
+
+
+def test_a_channel_the_portal_never_marked_still_goes_through_create_link():
+    reset()
+    client = FakeRedis()
+    s.save_portal(CFG, client)
+    s.save_static_cmds(CFG.slug, [STATIC_CMD], client)
+
+    class Answering(s.Portal):
+        def login(self):
+            self.token = "fresh"
+            return self.token
+
+        def create_link(self, cmd):
+            return "http://prov.example/live/9.ts?token=fresh"
+
+    original_portal, original_redis = s.Portal, s.get_redis
+    s.Portal, s.get_redis = Answering, lambda: client
+    try:
+        link, _, token = resolver.resolve(CFG.slug, "ffmpeg http://localhost/ch/9_")
+    finally:
+        s.Portal, s.get_redis = original_portal, original_redis
+
+    assert link.endswith("token=fresh") and token == "fresh"
+
+
 def test_the_fallback_command_survives_too():
     reset()
     client = FakeRedis()

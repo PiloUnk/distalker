@@ -351,6 +351,25 @@ def test_reading_the_channel_out_of_a_command():
         assert s.stream_id(cmd) == expected, cmd
 
 
+def test_a_command_reaches_the_portal_decoded_exactly_once():
+    """PHP form-decodes the query once, so what is already escaped must stay so.
+
+    quote(cmd, safe="") escaped the percent sign too, so '%3A' went out as
+    '%253A' and the portal read back a string no real box would have sent.
+    """
+    assert s.encode_cmd("ffmpeg http://h/a%3Ab") == "ffmpeg%20http://h/a%3Ab"
+    # The characters a URL keeps raw in a query stay raw, so the bytes we emit
+    # are the bytes a box emits.
+    assert s.encode_cmd("http://h/p?a=1&") .startswith("http://h/p?a=1")
+    # ...except the ones that would restructure our own request around it.
+    for smuggled in ("&", "#", ";"):
+        assert smuggled not in s.encode_cmd(f"http://h/1{smuggled}stream=9"), smuggled
+    # The ordinary case, unchanged: a marker has nothing in it to encode.
+    assert s.encode_cmd("ffmpeg http://localhost/ch/1_") == (
+        "ffmpeg%20http://localhost/ch/1_"
+    )
+
+
 # -- paging --------------------------------------------------------------
 
 
@@ -384,7 +403,122 @@ def page(ids, **extra):
     return js
 
 
+def test_the_paged_request_says_the_same_thing_several_ways():
+    """Belt and braces, as with the identity in _common_params.
+
+    A Ministra portal reads 'genre' and ignores the rest. The clones do not all
+    read the same one, and every parameter here is one that some other client
+    found a portal wanting -- sending them all costs a longer query string.
+    """
+    p = portal()
+    seen = []
+    p._get_json = lambda q, with_auth=True: seen.append(q) or {"js": {"data": []}}
+    p.get_ordered_list(3)
+    for expected in ("genre=*", "category=*", "fav=0", "force_ch_link_check=",
+                     "hd=0", "sortby=number", "p=3"):
+        assert expected in seen[0], f"{expected} missing from {seen[0]}"
+
+
 REFUSED = s.PortalError("portal returned an empty channel list (check the MAC address)")
+
+
+# -- the channels that need no link minted for them -----------------------
+
+
+def test_silence_is_not_a_no():
+    """Every portal synced before these flags were read carries neither.
+
+    Taking that as "needs no link" would move an entire installation onto the
+    static path at once, on nothing but the absence of evidence.
+    """
+    assert s.Portal._channel_from_row(row()).needs_link is None
+    assert s.portal_flag(None) is None
+    assert s.portal_flag("") is None
+
+
+def test_the_flags_are_read_in_every_shape_a_portal_writes_them():
+    for value in ("1", 1, True, "true", "yes"):
+        assert s.portal_flag(value) is True, value
+    for value in ("0", 0, False, "false", "no", "off"):
+        assert s.portal_flag(value) is False, value
+
+    # Either flag set means the portal mints the link; both clear means it does
+    # not; and both must be absent before the row counts as having said nothing.
+    def needs(**flags):
+        return s.Portal._channel_from_row(row(**flags)).needs_link
+
+    assert needs(use_http_tmp_link="1", use_load_balancing="0") is True
+    assert needs(use_http_tmp_link="0", use_load_balancing="1") is True
+    assert needs(use_http_tmp_link="0", use_load_balancing="0") is False
+    assert needs(use_load_balancing="0") is False
+
+
+def test_what_may_be_played_without_asking_the_portal():
+    """The table. Every entry that is False falls back on today's behaviour,
+    which is why none of these guards can break a portal that works now."""
+    static = "http://prov.example/USER/PASS/1225691"
+    assert s.plays_without_create_link(static, False)
+    # Multicast is a perfectly good static address, and ffmpeg opens it.
+    assert s.plays_without_create_link("udp://239.0.0.1:1234", False)
+    # 'ffmpeg' is a prefix word, not part of the address.
+    assert s.plays_without_create_link("ffmpeg " + static, False)
+
+    for cmd, why in (
+        ("http://localhost/ch/1_", "the portal talking to itself"),
+        ("http://127.0.0.1/ch/1_", "the whole of 127.0.0.0/8 is loopback"),
+        ("http://127.5.5.5/ch/1_", "still loopback"),
+        ("http://[::1]/ch/1_", "and in IPv6"),
+        ("http://[::ffff:127.0.0.1]/ch/1_", "and mapped back into IPv6"),
+        ("http://0.0.0.0/ch/1_", "the unspecified address means the same"),
+        ("http://stream.localhost/ch/1_", "RFC 6761 reserves the whole suffix"),
+        ("http:///ch/1", "an address with no host at all"),
+        ("ffrt4://ch/live/1", "a portal's own pseudo-URL plays as nothing"),
+        ("auto /media/file.mpg", "not an address until create_link makes one"),
+        (static + "?play_token=abc", "a token in the query is a link that expires"),
+    ):
+        assert not s.plays_without_create_link(cmd, False), why
+
+    # And the flags still decide first.
+    assert not s.plays_without_create_link(static, True)
+    assert not s.plays_without_create_link(static, None)
+
+
+def test_the_published_set_is_the_commands_and_nothing_else():
+    channels = [
+        s.Portal._channel_from_row(row(
+            id="1", cmd="ffmpeg http://localhost/ch/1_",
+            use_http_tmp_link="0", use_load_balancing="0")),
+        s.Portal._channel_from_row(row(
+            id="", cmd="http://prov.example/USER/PASS/22",
+            use_http_tmp_link="0", use_load_balancing="0")),
+        s.Portal._channel_from_row(row(
+            id="", cmd="http://prov.example/live/33", use_http_tmp_link="1")),
+    ]
+    assert s.static_commands(channels) == ["http://prov.example/USER/PASS/22"]
+    # A portal that marks nothing static publishes an empty list, not nothing.
+    assert s.static_commands([channels[0]]) == []
+
+
+def test_a_rewritten_command_is_never_static():
+    """canonical_cmd turns a resolved link into a loopback marker, and a marker
+    is only ever an instruction to the portal -- whatever the flags said about
+    the row it came from."""
+    channel = s.Portal._channel_from_row(row(
+        id="553690", cmd="http://prov.example/live.php?stream=553690",
+        use_http_tmp_link="0", use_load_balancing="0"))
+    assert channel.cmd_rewritten
+    assert channel.needs_link is False
+    assert not s.plays_without_create_link(channel.cmd, channel.needs_link)
+
+
+def test_a_channel_repeated_in_one_response_is_still_one_channel():
+    """Dispatcharr hashes a stream partly on its URL, so a duplicate row is a
+    second stream for one channel rather than a harmless extra line."""
+    p = portal()
+    p._get_json = lambda q, with_auth=True: {"js": {"data": [
+        row(id="1"), row(id="2", name="Two"), row(id="1"),
+    ]}}
+    assert [c.channel_id for c in p.get_all_channels()] == ["1", "2"]
 
 
 def test_a_portal_that_answers_in_one_request_is_never_paged():

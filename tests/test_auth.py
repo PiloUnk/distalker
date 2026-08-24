@@ -121,6 +121,49 @@ def test_the_portal_gets_the_last_word_on_why():
         raise AssertionError("status 1 must refuse the session")
 
 
+def test_the_refusal_arrives_without_the_markup_it_was_written_in():
+    """It lands in a Dispatcharr notification, where a <br/> is noise."""
+    p = portal({
+        "handshake": HANDSHAKE,
+        "get_profile": {"js": {"status": 1,
+                               "block_msg": "Subscription expired.<br/> Call us."}},
+    })
+    try:
+        p.login()
+    except s.PortalAuthError as exc:
+        assert str(exc) == "Subscription expired. Call us.", exc
+    else:
+        raise AssertionError("status 1 must refuse the session")
+
+
+def test_a_bound_mac_is_named_as_the_settings_that_fix_it():
+    """The one refusal here a user can act on, and the portal misnames it.
+
+    Its own wording points at the box; the problem is two values on the portal
+    line. Kept to the binding itself -- 'device limit reached' has no remedy,
+    and offering one would be worse than saying nothing.
+    """
+    p = portal({
+        "handshake": HANDSHAKE,
+        "get_profile": {"js": {"status": 1, "msg": "device id mismatch"}},
+    })
+    try:
+        p.login()
+    except s.PortalAuthError as exc:
+        assert "device_id2=" in str(exc), exc
+    else:
+        raise AssertionError("status 1 must refuse the session")
+
+    plain = portal({
+        "handshake": HANDSHAKE,
+        "get_profile": {"js": {"status": 1, "msg": "device limit reached"}},
+    })
+    try:
+        plain.login()
+    except s.PortalAuthError as exc:
+        assert str(exc) == "device limit reached", exc
+
+
 def test_a_second_step_that_still_fails_is_refused():
     p = portal(
         {"handshake": HANDSHAKE,
@@ -184,8 +227,45 @@ def test_the_whole_stb_identity_is_sent():
     p.login()
     query = [q for q in p.queries if "action=get_profile" in q][0]
     for expected in ("signature=" + "a" * 64, "sn=SN1", "stb_type=MAG322",
-                     "num_banks=1", "image_version=216", "hd=1", "ver=", "hw_version="):
+                     "num_banks=1", "image_version=216", "hd=1", "ver=", "hw_version=",
+                     # The two other clients send these and this one did not.
+                     # Harmless to a portal that ignores them, and the shape a
+                     # reseller's access filter looks for in one that does not.
+                     "client_type=STB", "video_out=hdmi"):
         assert expected in query, f"{expected} missing from {query}"
+
+
+def test_the_box_is_described_where_the_admin_panel_reads_it():
+    """'metrics' is what a portal stores and shows its operator.
+
+    Echoing the handshake's nonce back inside it is the part a portal could
+    actually check: it issued that value one request ago, and only something
+    that read the answer can quote it.
+    """
+    p = portal({"handshake": {"js": {"token": "TOK", "random": "R1"}},
+                "get_profile": {"js": {"status": 0}}},
+               serial_number="SN1", model="MAG322")
+    p.login()
+    query = [q for q in p.queries if "action=get_profile" in q][0]
+    for expected in ("%22random%22%3A%22R1%22", "%22model%22%3A%22MAG322%22",
+                     "%22sn%22%3A%22SN1%22", "%22type%22%3A%22STB%22"):
+        assert expected in query, f"{expected} missing from {query}"
+
+
+def test_the_prehash_is_this_box_rather_than_every_box():
+    """A constant shared by every user of one client is the version that fails.
+
+    Nothing in Ministra reads it; an access_filter.php in front of it can, and
+    that is the whole reason to send one at all.
+    """
+    p = portal({"handshake": HANDSHAKE, "get_profile": {"js": {"status": 0}}})
+    p.login()
+    expected = "prehash=" + s.prehash("00:1A:79:AA:BB:CC")
+    assert any(expected in q for q in p.queries if "action=handshake" in q), p.queries
+    assert any(expected in q for q in p.queries if "action=get_profile" in q), p.queries
+    # The MAC, not the box, and not case-sensitive about how it was written.
+    assert s.prehash("00:1a:79:aa:bb:cc") == s.prehash("00:1A:79:AA:BB:CC")
+    assert len(s.prehash("00:1A:79:AA:BB:CC")) == 40
 
 
 def test_a_dead_session_in_plain_text_is_an_auth_error():
@@ -213,6 +293,57 @@ def test_a_dead_session_in_plain_text_is_an_auth_error():
         assert "no longer authorised" in str(exc), exc
     else:
         raise AssertionError("'Authorization failed.' must be typed as an auth error")
+
+
+def test_every_shape_a_refusal_arrives_in():
+    """The table, so a shape met next is added here rather than argued about."""
+    for body in ("Authorization failed.",
+                 # The counter the stock server appends. The exact comparison
+                 # this replaces did not recognise it, and it is the refusal
+                 # the resolver exists to recover from.
+                 "Authorization failed. 75",
+                 "authorization failed",
+                 "Access denied.",
+                 "  Unauthorized request.\n"):
+        assert s.auth_refusal(body), body
+
+    for body in ("",
+                 # A proxy or WAF page: 38 characters, so only matching the
+                 # whole body keeps it out -- and it must stay out, or a host
+                 # that never answered sends the resolver re-authenticating.
+                 "<html><body>Access denied</body></html>",
+                 "Access denied by policy",
+                 "ffmpeg http://host/stream"):
+        assert not s.auth_refusal(body), body
+
+
+def test_a_refusal_can_arrive_as_perfectly_good_json():
+    """Panels that are not Ministra refuse inside the envelope, not instead of it.
+
+    Every one of these used to read as an ordinary reply: get_genres answered
+    this way counted as a portal with no genres, and 'Test portals' reported it
+    as authenticated with 0 groups.
+    """
+    assert s.envelope_refusal({"js": "Authorization failed."})
+    assert s.envelope_refusal({"js": {"msg": "Access denied."}})
+    # The panel's own wording is what gets quoted back.
+    assert "Invalid token" in s.envelope_refusal({"js": {"error": "Invalid token"}})
+
+
+def test_a_portal_asking_for_a_password_is_not_a_portal_refusing():
+    """The one false positive that would cost a working install.
+
+    'msg' is where a status-2 reply writes the sentence login() reads to know
+    it should call do_auth. Reading it here would turn every portal that says
+    'Authorization required' into a hard refusal and skip the step it asked
+    for; a status-1 'msg' is the provider's own wording, which login() quotes
+    better than a substitute could.
+    """
+    assert not s.envelope_refusal({"js": {"status": 2, "msg": "Authorization required"}})
+    assert not s.envelope_refusal({"js": {"status": 1, "msg": "Access denied."}})
+    # A reply that worked carries no refusal at all, in any field.
+    assert not s.envelope_refusal({"js": {"data": [], "total_items": 0}})
+    assert not s.envelope_refusal({"js": [{"id": "1", "title": "All"}]})
 
 
 def test_create_link_expiry_is_typed_so_the_resolver_can_recover():
@@ -283,17 +414,45 @@ def test_when_neither_endpoint_answers_the_configured_one_is_blamed():
     assert p.url == p.cfg.url, p.url
 
 
-def test_the_two_endpoints_map_onto_each_other():
+def test_the_configured_url_is_always_tried_first():
+    """Including one no standard install serves: it is the address handed out."""
+    for given in ("http://h/c/portal.php", "http://h/cp/api.php",
+                  "http://h:8080/stalker_portal/server/load.php"):
+        assert s.endpoint_candidates(given)[0] == given, given
+
+
+def test_the_second_guess_is_still_the_one_it_always_was():
+    """The pvr.stalker mapping, read both ways, so nothing found on the second
+    try before takes any longer now."""
     cases = {
         "http://h/c/portal.php": "http://h/server/load.php",
         "http://h/stalker_portal/c/portal.php": "http://h/stalker_portal/server/load.php",
         "http://h/server/load.php": "http://h/c/portal.php",
         "http://h:8080/c/portal.php": "http://h:8080/server/load.php",
-        # Nothing sensible to swap to.
-        "http://h/something.cgi": "",
     }
     for given, expected in cases.items():
-        assert s.alternate_endpoint(given) == expected, given
+        assert s.endpoint_candidates(given)[1] == expected, given
+
+
+def test_the_paths_probed_after_that():
+    """The spellings pvr.stalker never knew, and no path probed twice."""
+    found = s.endpoint_candidates("http://h/c/portal.php")
+    assert found == [
+        "http://h/c/portal.php",
+        "http://h/server/load.php",
+        "http://h/portal.php",
+        "http://h/stalker_portal/server/load.php",
+    ], found
+
+    # A base that is already a stalker_portal install: nesting it again would
+    # probe a path no server has.
+    nested = s.endpoint_candidates("http://h/stalker_portal/c/portal.php")
+    assert not any(p.count("stalker_portal") > 1 for p in nested), nested
+
+    # A panel under a path of its own keeps that path, and its siblings are
+    # looked for beside it rather than at the site root.
+    panel = s.endpoint_candidates("http://h/cp/api.php")
+    assert all("/cp/" in p for p in panel), panel
 
 
 def test_there_is_no_watchdog():

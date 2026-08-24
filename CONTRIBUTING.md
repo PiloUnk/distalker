@@ -139,10 +139,10 @@ added or deleted would silently rebind existing channels to the other portal.
 
 It runs inside the container with no persistence, so it comes back empty from
 every restart — which used to kill every channel until someone pressed Sync,
-twice observed before it was understood. Everything `save_portal` and
-`save_fallback` publish is therefore mirrored to `/data/distalker/state/*.json`
-(`0600`: credentials), read only when Redis has nothing, and written back to
-Redis on first use. Reads go through `_client_or_none`, so an unreachable Redis
+twice observed before it was understood. Everything `save_portal`,
+`save_static_cmds` and `save_fallback` publish is therefore mirrored to
+`/data/distalker/state/*.json` (`0600`: credentials), read only when Redis has
+nothing, and written back to Redis on first use. Reads go through `_client_or_none`, so an unreachable Redis
 degrades rather than raising. The session token is deliberately *not* mirrored:
 it expires within the hour, and losing it costs one handshake.
 
@@ -150,6 +150,31 @@ Writing the mirror only on sync left the same trap one step along — a restart
 before the first sync, or a lost data volume, and there is again nothing to
 read. `Plugin._republish` runs on the assign path instead, which the button,
 every `m3u_refresh` and every `channel_error` all reach.
+
+### Some channels never reach the portal at tune time
+
+A Stalker row carries `use_http_tmp_link` and `use_load_balancing`, and the
+portal's own `player.js` calls `create_link` only when one of them is set —
+everything else plays the `cmd` the listing already gave. pvr.stalker does the
+same and cites that line for it (`ChannelManager::GetStreamURL`).
+
+Sync evaluates `plays_without_create_link` per row and publishes the commands
+that qualify as a set (`save_static_cmds`); `resolver.resolve` checks it before
+doing anything else, and on a hit returns the command's own URL with no
+handshake and no `create_link`. On nearly every portal the set is empty — a
+stock row is a loopback marker, which only the portal can resolve whatever its
+flags say. The family it exists for is the one `undoubled_link` was written
+for: providers that answer the listing with a resolved link and then mangle it
+when handed it back.
+
+Four guards narrow it, and every one of them falls back to asking the portal,
+so none can break an install that works today. Absent flags mean *no evidence*
+rather than "no". The scheme must be one ffmpeg opens (a portal's own
+`ffrt4://` pseudo-URL parses like an address and plays as nothing). The host
+must not be loopback in any of its spellings. And — this one is ours, not the
+reference behaviour — the command must carry **no query string**: a link that
+expires keeps its token there, and by the time a stream fails the resolver has
+already become ffmpeg and Dispatcharr has spent this channel's failover.
 
 ### The ffmpeg defaults carry no `-reconnect`, and that is load-bearing
 
@@ -258,6 +283,44 @@ Consequences that shape the code:
   state of every portal rather than the story of the last click
   (`Plugin._report`). Anything more urgent goes to Dispatcharr's notification
   centre, which does reach an open browser (`sync.announce`).
+
+### The panel is shown a redacted list
+
+The settings row is served to every account on the install and painted straight
+into a textarea, so it is the one copy of the portal list that must not hold a
+credential. `Plugin._save_settings` therefore writes two different things: the
+whole list to `portals.txt`, and `stalker_api.mask_portals()` of it to the row.
+The MAC, `username`, `password`, `device_id`, `device_id2`, `serial` and
+`signature` become `••••`; names, URLs and the tuning keys stay, because a box
+of nothing but bullets is one nobody can recognise their own portals in.
+
+Redaction is a property of the **write path and nothing else**.
+`_reconcile_registry` runs `unmask_portals()` on whatever the panel sent and
+always returns the real list, so every migration, action and sync downstream
+goes on reading plain lines and never has to know.
+
+Four things are easy to break here:
+
+- **Never mirror redacted text.** `_save_settings` checks `is_masked()` before
+  writing `portals.txt`, because `_failed()` can be reached with settings that
+  never passed through `_reconcile_registry` — and mirroring a row of tokens
+  would write them over the only copy of the credentials.
+- **Never redact before the file holds the list.** The guard is
+  `digest(stored) == digest(text)`. A registry that could not be written leaves
+  the row as the only copy there is, and hiding the only copy loses it.
+- **The token stands where the MAC stands.** `split_portal_line` decides which
+  field is which by *where the MAC sits*, so `_mac_index()` counts the token as
+  one; without that, redacting an unnamed line's MAC shifts its fields by one.
+  For the same reason `mask_portals` writes the derived name out.
+- **A redacted line is paired back up by slug, then by URL.** Renaming a portal
+  and repointing it are both ordinary edits, and each changes the half the other
+  is recognised by. Change both at once and nothing matches: the token survives
+  `unmask_portals`, and `Plugin._portals` quotes the line back and asks for it
+  to be retyped rather than parsing a MAC address made of bullets.
+
+None of this is encryption at rest, and the README says so: the resolver reads
+the MAC on every tune with no Django, so `portals.txt` and the state mirrors go
+on holding it in the clear at `0600`.
 
 ### Actions
 

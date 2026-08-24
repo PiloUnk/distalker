@@ -46,8 +46,13 @@ def log(message: str) -> None:
     print(f"[distalker] {message}", file=sys.stderr, flush=True)
 
 
-def resolve(slug: str, cmd: str) -> tuple[str, stalker_api.PortalConfig]:
-    """Return a playable URL for ``cmd``, refreshing the session if needed."""
+def resolve(slug: str, cmd: str) -> tuple[str, stalker_api.PortalConfig, str]:
+    """Return a playable URL for ``cmd``, refreshing the session if needed.
+
+    The token comes back with it: the stream is fetched with the session when
+    it is served by the portal itself, and only the session that minted the
+    link is the one it will accept.
+    """
     try:
         client = stalker_api.get_redis()
     except Exception as exc:
@@ -65,6 +70,26 @@ def resolve(slug: str, cmd: str) -> tuple[str, stalker_api.PortalConfig]:
         )
 
     cached = stalker_api.get_cached_token(slug, client)
+
+    # A channel the portal itself marked as needing no temporary link is played
+    # from the command the listing gave, with no request to the portal at all.
+    # That is what the portal's own player does, what pvr.stalker does, and
+    # here it also skips the one request that is known to go wrong: the
+    # providers undoubled_link exists for answer create_link by gluing their
+    # base in front of a command that was already a link, and the reply is
+    # thrown away again a moment later.
+    #
+    # The token is whatever was already cached -- it may be nothing, and that
+    # is not worth a handshake to fix. It only ever feeds a header, and a
+    # command with no query string is not a link the portal minted for a
+    # session in the first place.
+    if cmd in stalker_api.load_static_cmds(slug, client):
+        link = stalker_api.extract_link(cmd)
+        if link:
+            log(f"{slug}: the portal marks this channel as needing no "
+                "temporary link; playing its command as it stands")
+            return link, cfg, cached or ""
+
     portal = stalker_api.Portal(cfg, token=cached or "")
 
     if cached:
@@ -83,7 +108,7 @@ def resolve(slug: str, cmd: str) -> tuple[str, stalker_api.PortalConfig]:
         else:
             for warning in portal.warnings:
                 log(f"{slug}: {warning}")
-            return link, cfg
+            return link, cfg, portal.token
 
     portal.login()
     # Cached before the link is asked for, not after: the token is good either
@@ -95,15 +120,21 @@ def resolve(slug: str, cmd: str) -> tuple[str, stalker_api.PortalConfig]:
     # answer is reported too, and not only what login() found.
     for warning in portal.warnings:
         log(f"{slug}: {warning}")
-    return link, cfg
+    return link, cfg, portal.token
 
 
-def build_ffmpeg_command(cfg: stalker_api.PortalConfig, url: str) -> list:
+def build_ffmpeg_command(
+    cfg: stalker_api.PortalConfig, url: str, token: str = ""
+) -> list:
     """Expand the portal's ffmpeg template into an argv list.
 
     Referer and Origin are derived from the **stream** URL, not the portal.
     Providers routinely serve the stream from a different host or port than
     the portal API, and expect the request to look like it came from there.
+
+    The session goes with them when the stream is the portal's own -- see
+    :func:`stalker_api.stream_credential_safe`, which is what keeps a
+    subscriber's MAC out of a request to somebody else's CDN.
     """
     import shlex
     from urllib.parse import urlparse
@@ -111,8 +142,7 @@ def build_ffmpeg_command(cfg: stalker_api.PortalConfig, url: str) -> list:
     parsed = urlparse(url)
     origin = f"{parsed.scheme}://{parsed.netloc}"
 
-    headers = dict(stalker_api.stream_headers(cfg.model))
-    headers["Origin"] = origin
+    headers = stalker_api.stream_headers(cfg, url, token)
     header_blob = "".join(f"{k}: {v}\r\n" for k, v in headers.items())
 
     template = cfg.ffmpeg_args or stalker_api.DEFAULT_FFMPEG_ARGS
@@ -229,7 +259,7 @@ def probe(pseudo_url: str) -> int:
         return 2
 
     try:
-        link, cfg = resolve(slug, cmd)
+        link, cfg, token = resolve(slug, cmd)
     except Exception as exc:
         log(f"resolve failed: {exc}")
         return 1
@@ -242,10 +272,11 @@ def probe(pseudo_url: str) -> int:
 
     parsed = urlparse(link)
     origin = f"{parsed.scheme}://{parsed.netloc}"
-    headers = dict(stalker_api.stream_headers(cfg.model))
+    headers = stalker_api.stream_headers(cfg, link, token)
     headers["User-Agent"] = stalker_api.USER_AGENT
     headers["Referer"] = origin + "/"
-    headers["Origin"] = origin
+    print("session   : " + ("sent with the stream"
+                            if "Cookie" in headers else "not this host's to send"))
 
     try:
         resp = requests.get(link, headers=headers, stream=True, timeout=20)
@@ -293,7 +324,7 @@ def main(argv: list) -> int:
         return 2
 
     try:
-        link, cfg = resolve(slug, cmd)
+        link, cfg, token = resolve(slug, cmd)
     except PortalError as exc:
         log(f"{slug}: {exc}")
         return 1
@@ -303,7 +334,7 @@ def main(argv: list) -> int:
 
     log(f"{slug}: resolved -> {link.split('?', 1)[0]}")
 
-    command = build_ffmpeg_command(cfg, link)
+    command = build_ffmpeg_command(cfg, link, token)
     executable = shutil.which(command[0]) or command[0]
     try:
         os.execv(executable, command)
