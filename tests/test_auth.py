@@ -371,17 +371,45 @@ def test_when_neither_endpoint_answers_the_configured_one_is_blamed():
     assert p.url == p.cfg.url, p.url
 
 
-def test_the_two_endpoints_map_onto_each_other():
+def test_the_configured_url_is_always_tried_first():
+    """Including one no standard install serves: it is the address handed out."""
+    for given in ("http://h/c/portal.php", "http://h/cp/api.php",
+                  "http://h:8080/stalker_portal/server/load.php"):
+        assert s.endpoint_candidates(given)[0] == given, given
+
+
+def test_the_second_guess_is_still_the_one_it_always_was():
+    """The pvr.stalker mapping, read both ways, so nothing found on the second
+    try before takes any longer now."""
     cases = {
         "http://h/c/portal.php": "http://h/server/load.php",
         "http://h/stalker_portal/c/portal.php": "http://h/stalker_portal/server/load.php",
         "http://h/server/load.php": "http://h/c/portal.php",
         "http://h:8080/c/portal.php": "http://h:8080/server/load.php",
-        # Nothing sensible to swap to.
-        "http://h/something.cgi": "",
     }
     for given, expected in cases.items():
-        assert s.alternate_endpoint(given) == expected, given
+        assert s.endpoint_candidates(given)[1] == expected, given
+
+
+def test_the_paths_probed_after_that():
+    """The spellings pvr.stalker never knew, and no path probed twice."""
+    found = s.endpoint_candidates("http://h/c/portal.php")
+    assert found == [
+        "http://h/c/portal.php",
+        "http://h/server/load.php",
+        "http://h/portal.php",
+        "http://h/stalker_portal/server/load.php",
+    ], found
+
+    # A base that is already a stalker_portal install: nesting it again would
+    # probe a path no server has.
+    nested = s.endpoint_candidates("http://h/stalker_portal/c/portal.php")
+    assert not any(p.count("stalker_portal") > 1 for p in nested), nested
+
+    # A panel under a path of its own keeps that path, and its siblings are
+    # looked for beside it rather than at the site root.
+    panel = s.endpoint_candidates("http://h/cp/api.php")
+    assert all("/cp/" in p for p in panel), panel
 
 
 def test_there_is_no_watchdog():

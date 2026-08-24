@@ -254,7 +254,7 @@ class PortalEndpointError(PortalError):
 
     A 404, or a body that is not JSON at all. Separated because it is the one
     failure with a second thing worth trying: the same portal on its other
-    path -- see :func:`alternate_endpoint`.
+    path -- see :func:`endpoint_candidates`.
     """
 
 
@@ -881,53 +881,75 @@ def normalize_portal_url(url: str) -> str:
     path = parsed.path
     lower = path.lower()
 
-    if lower.endswith(("/portal.php", "/load.php")):
-        pass  # explicit endpoint: leave exactly as given
+    if lower.endswith(".php"):
+        # An explicit endpoint, left exactly as given -- including a path no
+        # standard install serves. This is the one departure from stalkerhek,
+        # which swaps any other .php for portal.php in the same directory:
+        # panels living under a path of their own do exist, that path is the
+        # address the provider handed out, and replacing it with a guess is how
+        # the one URL known to work stops being tried at all.
+        # endpoint_candidates() probes the standard siblings after it anyway,
+        # so nothing is lost by trusting what was pasted first.
+        pass
     elif path in ("", "/"):
         path = "/portal.php"
-    elif lower.endswith(".php"):
-        # Some other .php file: swap in portal.php from the same directory.
-        directory = path.rsplit("/", 1)[0]
-        path = f"{directory}/portal.php"
     else:
         path = path.rstrip("/") + "/portal.php"
 
     return parsed._replace(path=path).geturl()
 
 
-def alternate_endpoint(url: str) -> str:
-    """The other place a Stalker API lives, or '' when there isn't one.
+def endpoint_candidates(url: str) -> List[str]:
+    """Where a Stalker API might answer for this URL, best guess first.
 
-    Ministra answers on two paths and installs differ in which they expose:
-    ``<base>/c/portal.php``, which is what :func:`normalize_portal_url` builds
-    and what most providers hand out, and ``<base>/server/load.php``, which is
-    the older canonical one and the only one pvr.stalker has ever asked for.
-    A portal serving just one of them used to be unusable if the user had been
-    given the other, with a 404 and nothing to suggest.
+    The endpoint cannot be worked out from what a user pastes. Ministra serves
+    ``<base>/stalker_portal/server/load.php`` and shows its interface at
+    ``<base>/stalker_portal/c/``; reseller panels serve ``<base>/c/portal.php``
+    or ``<base>/portal.php``, and some serve neither, from a path of their own.
+    pvr.stalker knows the first pair and stalkerhek the second. No client knows
+    all of them, which is why this is a list to probe rather than a mapping to
+    apply.
 
-    The mapping is pvr.stalker's, read backwards as well as forwards::
+    The configured URL always comes first, and the second entry is still what
+    :func:`alternate_endpoint` used to be the whole of -- the pvr.stalker
+    mapping, read both ways. The rest are added after it, so a portal that was
+    found on the second try before is found on the second try still.
 
-        http://h/c/portal.php                -> http://h/server/load.php
-        http://h/stalker_portal/c/portal.php -> http://h/stalker_portal/server/load.php
-        http://h/server/load.php             -> http://h/c/portal.php
+    The siblings are built from the install root: the configured directory with
+    a trailing ``/c`` or ``/server`` taken off, because both of those are the
+    API's own subdirectory rather than part of where the install lives.
     """
     parsed = urlparse(url)
-    path = parsed.path
-    directory, _, filename = path.rpartition("/")
-    filename = filename.lower()
+    directory, _, filename = parsed.path.rpartition("/")
+    if not filename.lower().endswith(".php"):
+        # Not an endpoint at all: read the whole path as the directory rather
+        # than throwing away its last segment.
+        directory = parsed.path
 
-    if filename == "portal.php":
-        base = directory[:-2] if directory.lower().endswith("/c") else directory
-        new_path = base + "/server/load.php"
-    elif filename == "load.php":
-        base = directory[:-7] if directory.lower().endswith("/server") else directory
-        new_path = base + "/c/portal.php"
-    else:
-        return ""
+    base = directory.rstrip("/")
+    for own in ("/c", "/server"):
+        if base.lower().endswith(own):
+            base = base[: -len(own)]
+            break
 
-    if new_path == path:
-        return ""
-    return parsed._replace(path=new_path).geturl()
+    paths = [
+        parsed.path,
+        # The pvr.stalker pair, which is what this list grew out of.
+        base + "/server/load.php",
+        base + "/c/portal.php",
+        base + "/portal.php",
+    ]
+    # Already the canonical form when the base ends there -- nesting it again
+    # would probe a path no server has.
+    if "/stalker_portal" not in base.lower():
+        paths.append(base + "/stalker_portal/server/load.php")
+
+    candidates: List[str] = []
+    for path in paths:
+        candidate = parsed._replace(path=path).geturl()
+        if candidate not in candidates:
+            candidates.append(candidate)
+    return candidates
 
 
 # ---------------------------------------------------------------------------
@@ -1673,7 +1695,7 @@ class Portal:
           explicit refusal (:class:`PortalAuthError`) is still fatal, because
           that is the portal answering rather than failing to.
         """
-        self._handshake_on_either_endpoint()
+        self._handshake_on_any_endpoint()
 
         try:
             self.profile = self.get_profile()
@@ -1709,46 +1731,53 @@ class Portal:
 
         return self.token
 
-    def _handshake_on_either_endpoint(self) -> None:
-        """Shake hands, trying the portal's other API path if this one is not it.
+    def _handshake_on_any_endpoint(self) -> None:
+        """Shake hands, walking the portal's other API paths if this one is not it.
 
         The handshake is every session's first request, so a portal reached at
         the wrong path fails here and nowhere later -- which makes this the one
-        place worth spending an extra round-trip on.
+        place worth spending extra round-trips on.
 
-        Only a :class:`PortalEndpointError` earns that second try: a 404, or an
-        answer that is not JSON. A portal that is unreachable, unwell or
-        refusing the MAC would answer identically on both paths, and at tune
-        time a wasted round-trip is time Dispatcharr is not yet spending on the
-        next source.
+        Only a :class:`PortalEndpointError` moves to the next candidate: a 404,
+        or an answer that is not JSON. A portal that is unreachable, unwell or
+        refusing the MAC would answer identically on every path -- they all
+        live on the same host -- and at tune time a wasted round-trip is time
+        Dispatcharr is not yet spending on the next source. That is also why
+        the list is only walked when the user's URL is wrong, which is a
+        setup-time mistake rather than something that happens mid-service.
 
         The swap lasts for this session only. Nothing is written back, so the
         cost is one failed request per sync and per token expiry -- small, and
         the warning tells the user how to stop paying it for good.
         """
-        try:
-            self.handshake()
-            return
-        except PortalEndpointError as exc:
-            alternate = alternate_endpoint(self.url)
-            if not alternate:
+        first_failure: Optional[PortalError] = None
+
+        for candidate in endpoint_candidates(self.url):
+            self.url = candidate
+            try:
+                self.handshake()
+            except PortalEndpointError as exc:
+                if first_failure is None:
+                    first_failure = exc
+                continue
+            except PortalError:
+                # Not a statement about the path, so no other path can help.
+                self.url = self.cfg.url
                 raise
-            first_failure = exc
 
-        self.url = alternate
-        try:
-            self.handshake()
-        except PortalError:
-            # The other path is no better. Report the original failure: it is
-            # the one about the URL the user actually configured.
-            self.url = self.cfg.url
-            raise first_failure
+            if candidate != self.cfg.url:
+                self.warnings.append(
+                    f"the portal does not answer at {self.cfg.url} "
+                    f"({first_failure}), but does at {candidate}; put that on "
+                    "its portal line to save a failed request on every sync"
+                )
+            return
 
-        self.warnings.append(
-            f"the portal does not answer at {self.cfg.url} ({first_failure}), "
-            f"but does at {alternate}; put that on its portal line to save a "
-            "failed request on every sync"
-        )
+        # Every path was answered by something that was not a Stalker API.
+        # Report the first failure: it is the one about the URL the user
+        # actually configured.
+        self.url = self.cfg.url
+        raise first_failure
 
     @staticmethod
     def _profile_status(profile: Dict[str, Any]) -> int:

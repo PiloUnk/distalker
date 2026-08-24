@@ -94,8 +94,11 @@ def test_url_normalisation():
         # An explicit load.php must survive: older portals only serve that.
         "http://a.example/stalker_portal/server/load.php":
             "http://a.example/stalker_portal/server/load.php",
-        # Any other .php is swapped for portal.php in the same directory.
-        "http://a.example/c/other.php": "http://a.example/c/portal.php",
+        # The one departure from stalkerhek, which swaps any other .php for
+        # portal.php in the same directory. Panels under a path of their own
+        # exist, and that path is the address the provider handed out;
+        # endpoint_candidates() probes the standard siblings after it.
+        "http://a.example/c/other.php": "http://a.example/c/other.php",
         # A missing scheme is filled in rather than rejected.
         "somedomain.com:8080/c/": "http://somedomain.com:8080/c/portal.php",
         # Ports and deep paths must be preserved.
