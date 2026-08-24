@@ -211,6 +211,33 @@ def test_prose_instead_of_json_is_not_a_reason_to_ask_again():
         restore()
 
 
+def test_the_counter_the_stock_server_appends_does_not_hide_the_refusal():
+    """'Authorization failed. 75' is what Ministra actually sends.
+
+    The number is a debug counter. Read as prose, this arrived typed as an
+    endpoint failure -- which the resolver never re-authenticates on, so the
+    one answer the cached-token path exists to survive failed the tune instead.
+    """
+    p = portal([FakeResponse(200, text="Authorization failed. 75")])
+    try:
+        p._get_json("action=create_link")
+    except s.PortalAuthError as exc:
+        assert "no longer authorised" in str(exc), exc
+    else:
+        raise AssertionError("the stale-token refusal must reach the resolver")
+
+
+def test_a_refusal_in_json_never_looks_like_an_empty_portal():
+    """Nothing here is malformed, so only the wording says the session is gone."""
+    p = portal([FakeResponse(200, payload={"js": {"error": "Invalid token"}})])
+    try:
+        p._get_json("action=get_genres")
+    except s.PortalAuthError as exc:
+        assert "Invalid token" in str(exc), exc
+    else:
+        raise AssertionError("a refused session must not read as a portal with no genres")
+
+
 def test_the_sync_asks_for_retries_and_the_test_action_does_not():
     """The one asymmetry that matters, pinned so a refactor keeps it.
 

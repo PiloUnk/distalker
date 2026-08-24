@@ -215,6 +215,57 @@ def test_a_dead_session_in_plain_text_is_an_auth_error():
         raise AssertionError("'Authorization failed.' must be typed as an auth error")
 
 
+def test_every_shape_a_refusal_arrives_in():
+    """The table, so a shape met next is added here rather than argued about."""
+    for body in ("Authorization failed.",
+                 # The counter the stock server appends. The exact comparison
+                 # this replaces did not recognise it, and it is the refusal
+                 # the resolver exists to recover from.
+                 "Authorization failed. 75",
+                 "authorization failed",
+                 "Access denied.",
+                 "  Unauthorized request.\n"):
+        assert s.auth_refusal(body), body
+
+    for body in ("",
+                 # A proxy or WAF page: 38 characters, so only matching the
+                 # whole body keeps it out -- and it must stay out, or a host
+                 # that never answered sends the resolver re-authenticating.
+                 "<html><body>Access denied</body></html>",
+                 "Access denied by policy",
+                 "ffmpeg http://host/stream"):
+        assert not s.auth_refusal(body), body
+
+
+def test_a_refusal_can_arrive_as_perfectly_good_json():
+    """Panels that are not Ministra refuse inside the envelope, not instead of it.
+
+    Every one of these used to read as an ordinary reply: get_genres answered
+    this way counted as a portal with no genres, and 'Test portals' reported it
+    as authenticated with 0 groups.
+    """
+    assert s.envelope_refusal({"js": "Authorization failed."})
+    assert s.envelope_refusal({"js": {"msg": "Access denied."}})
+    # The panel's own wording is what gets quoted back.
+    assert "Invalid token" in s.envelope_refusal({"js": {"error": "Invalid token"}})
+
+
+def test_a_portal_asking_for_a_password_is_not_a_portal_refusing():
+    """The one false positive that would cost a working install.
+
+    'msg' is where a status-2 reply writes the sentence login() reads to know
+    it should call do_auth. Reading it here would turn every portal that says
+    'Authorization required' into a hard refusal and skip the step it asked
+    for; a status-1 'msg' is the provider's own wording, which login() quotes
+    better than a substitute could.
+    """
+    assert not s.envelope_refusal({"js": {"status": 2, "msg": "Authorization required"}})
+    assert not s.envelope_refusal({"js": {"status": 1, "msg": "Access denied."}})
+    # A reply that worked carries no refusal at all, in any field.
+    assert not s.envelope_refusal({"js": {"data": [], "total_items": 0}})
+    assert not s.envelope_refusal({"js": [{"id": "1", "title": "All"}]})
+
+
 def test_create_link_expiry_is_typed_so_the_resolver_can_recover():
     """A dead token is usually a hollow success, not a refusal.
 

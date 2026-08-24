@@ -66,10 +66,46 @@ STB_IMAGE_VERSION = 216
 STB_HW_VERSION = "1.7-BD-00"
 STB_NUM_BANKS = 1
 
-# What a portal answers with, in plain text and with no JSON around it, once
-# the token it was given is no longer good. Matched exactly because it is a
-# fixed string in Ministra rather than something a reseller writes.
-AUTH_FAILED_BODY = "authorization failed."
+# The refusals Ministra answers with in plain text, HTTP 200 attached and no
+# JSON around them, and what each of them actually means. Matched against the
+# whole body rather than searched for inside it: these are bare phrases, so a
+# proxy or a WAF answering '<html><body>Access denied</body></html>' -- 38
+# characters, under any length a cap would catch -- would otherwise be read as
+# the portal speaking, and send the resolver off to re-authenticate against
+# something that never answered at all.
+#
+# Only the first carries a trailing number, and it is a debug counter rather
+# than anything to read. Matching without it is most of the point of this
+# table: 'Authorization failed. 75' is what the stock server actually sends,
+# and the exact-string comparison this replaces did not recognise it -- so the
+# one refusal the resolver exists to recover from arrived typed as an endpoint
+# failure, which is never re-authenticated on and costs a second request to the
+# other path of a portal that is already refusing us.
+AUTH_REFUSALS = (
+    (
+        re.compile(r"^authorization\s+failed[.!]*(?:\s+\d+)?$", re.I),
+        "portal says the session is no longer authorised",
+    ),
+    (
+        re.compile(r"^access\s+denied[.!]*$", re.I),
+        "portal says this account is denied access",
+    ),
+    (
+        re.compile(r"^unauthorized\s+request[.!]*$", re.I),
+        "portal did not receive the MAC address it authorises on",
+    ),
+)
+
+# Wording accepted inside a JSON envelope's 'error' field, beyond the three
+# above. Wider on purpose, and applied in one narrow place: a panel that fills
+# in 'error' has said something went wrong deliberately -- a reply that worked
+# carries no 'error' at all -- so 'Invalid token' and a bare 'unauthorized' are
+# worth reading there, where the same breadth against an arbitrary body would
+# match half the error pages on the internet.
+ENVELOPE_REFUSAL = re.compile(
+    r"authorization|access\s+denied|unauthorized|auth\s+failed|invalid\s+token",
+    re.I,
+)
 
 # Answers worth asking again for. Everything else is the portal having made up
 # its mind: a 404 is not going to become a 200, and a 403 is the subject of
@@ -230,6 +266,49 @@ class PortalAuthError(PortalError):
     portal's own wording ("blocked", "subscription expired") says more than
     anything this plugin could infer.
     """
+
+
+def auth_refusal(body: Any) -> str:
+    """What a plain-text answer says about the session, or "" if it says nothing."""
+    text = str(body or "").strip()
+    for pattern, message in AUTH_REFUSALS:
+        if pattern.match(text):
+            return message
+    return ""
+
+
+def envelope_refusal(payload: Any) -> str:
+    """The same, for portals that refuse inside the envelope rather than instead of it.
+
+    Not Ministra's behaviour, and common in what this plugin actually meets.
+    Every one of these used to arrive as an ordinary reply: ``get_genres``
+    answered ``{'js': {'error': 'Invalid token'}}`` counted as a portal with no
+    genres, and 'Test portals' reported it as authenticated with 0 groups.
+
+    ``error`` is read with the wide vocabulary. ``msg`` only with the three
+    exact bodies, and only when nothing else in the reply has already given a
+    verdict: a reply carrying a ``status`` is one :meth:`Portal.login` reads
+    for itself, including the sentence beside it -- which is the provider's own
+    wording, and better than anything this could substitute for it.
+    """
+    js = payload.get("js") if isinstance(payload, dict) else None
+    # Some panels put the phrase straight in 'js' rather than in a field of it.
+    if isinstance(js, str):
+        return auth_refusal(js)
+    if not isinstance(js, dict):
+        return ""
+
+    if js.get("status") is None:
+        exact = auth_refusal(js.get("msg"))
+        if exact:
+            return exact
+
+    error = str(js.get("error") or "").strip()
+    # A field longer than a sentence is a document somebody stuffed in there,
+    # not a refusal worth quoting back at the user.
+    if error and len(error) <= 200 and ENVELOPE_REFUSAL.search(error):
+        return f"portal refused the session: {error}"
+    return ""
 
 
 # ---------------------------------------------------------------------------
@@ -1384,18 +1463,31 @@ class Portal:
             raise PortalError(message)
 
         try:
-            return resp.json()
+            payload = resp.json()
         except ValueError:
-            snippet = (resp.text or "").strip()[:300]
+            # Classified on the whole body and displayed truncated: the
+            # patterns are anchored, so cutting first could only ever hide a
+            # refusal, never invent one.
+            body = (resp.text or "").strip()
             # A dead session is answered in plain text with a 200 attached, so
             # it arrives here rather than as an HTTP error. Saying so is what
             # lets the resolver re-authenticate instead of failing the tune.
-            if snippet.lower() == AUTH_FAILED_BODY:
-                raise PortalAuthError("portal says the session is no longer authorised")
+            refusal = auth_refusal(body)
+            if refusal:
+                raise PortalAuthError(refusal)
             # Anything else that is not JSON is an HTML error page, a login
             # form, or a landing page: something is listening, but it is not a
             # Stalker API, so the other endpoint is worth a try.
-            raise PortalEndpointError(f"portal returned non-JSON response: {snippet}")
+            raise PortalEndpointError(
+                f"portal returned non-JSON response: {body[:300]}"
+            )
+
+        # A refusal can also arrive as perfectly good JSON, and then it is not
+        # this reply that is unusable but the session behind it.
+        refusal = envelope_refusal(payload)
+        if refusal:
+            raise PortalAuthError(refusal)
+        return payload
 
     # -- authentication ---------------------------------------------------
 
