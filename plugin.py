@@ -131,6 +131,7 @@ class Plugin:
             settings = self._reconcile_registry(settings, logger)
             settings = self._migrate_legacy_globals(settings, logger)
             settings = self._migrate_ffmpeg_args(settings, logger)
+            settings = self._drop_unknown_settings(settings, logger)
             self._drop_legacy_schedule(logger)
 
             result = handler(params or {}, settings, logger)
@@ -292,6 +293,41 @@ class Plugin:
         logger.info(
             "distalker: replaced the pre-0.9.1 ffmpeg arguments, which prevented "
             "Dispatcharr from failing over to a channel's other sources"
+        )
+        self._save_settings(updated)
+        return updated
+
+    def _drop_unknown_settings(self, settings: Dict[str, Any], logger) -> Dict[str, Any]:
+        """Delete stored settings no field in the manifest declares any more.
+
+        Taking a field out of plugin.json only stops the panel *rendering* it.
+        The value stays in PluginConfig.settings, which Dispatcharr serves to
+        every account on the install -- so the Add-portal form that went in
+        0.4.0 left a MAC, a password and a portal URL sitting in the API
+        response for months, belonging to a portal the user had since dropped.
+        Redacting the portal list and leaving those behind would have been
+        half a job.
+
+        The manifest is the single definition of the panel, so anything it does
+        not declare is dead by construction; test_manifest.py pins that every
+        setting the code reads is declared. Runs after the migrations, which
+        read keys of their own that this would otherwise take first.
+
+        The open panel goes on replaying the stale keys until the page is
+        reloaded -- it PUTs the state it fetched, same as with the portal list
+        -- so this runs on every action rather than once.
+        """
+        known = {field["id"] for field in self.fields}
+        stale = sorted(key for key in self._raw_settings() if key not in known)
+        if not stale:
+            return settings
+
+        updated = {k: v for k, v in settings.items() if k in known}
+        logger.info(
+            "distalker: dropped %d stored setting(s) the panel no longer has a "
+            "field for: %s",
+            len(stale),
+            ", ".join(stale),
         )
         self._save_settings(updated)
         return updated
@@ -841,6 +877,7 @@ class Plugin:
         settings = self._reconcile_registry(settings, logger)
         settings = self._migrate_legacy_globals(settings, logger)
         settings = self._migrate_ffmpeg_args(settings, logger)
+        settings = self._drop_unknown_settings(settings, logger)
 
         try:
             result = self._sync_portals(settings, logger, full=full)

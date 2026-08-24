@@ -228,6 +228,52 @@ def test_settings_the_code_reads_are_declared():
         assert key in ids, f"the code reads '{key}' but the panel never renders it"
 
 
+def test_settings_the_panel_no_longer_has_a_field_for_are_dropped():
+    """Taking a field out of the manifest stops the panel rendering it and
+    nothing else. The Add-portal form went in 0.4.0 and its values stayed in
+    the settings row -- a MAC, a password and a URL that Dispatcharr went on
+    serving to every account on the install, for a portal long since deleted.
+    """
+    reset()
+    p, store, _ = make_plugin({
+        "portals": PORTALS,
+        "new_url": "http://gone.example:8080/c/",
+        "new_mac": "00:00:00:00:00:00",
+        "new_password": "hunter2",
+        "sync_interval_hours": 12,
+    })
+    try:
+        with stubbed():
+            run(p, "apply_profile", store["settings"])
+    finally:
+        store["restore"]()
+
+    for dead in ("new_url", "new_mac", "new_password", "sync_interval_hours"):
+        assert dead not in store["settings"], f"{dead} is still being served"
+    assert "portals" in store["settings"], "the declared ones must stay"
+    assert store["settings"]["status"], "and so must what the action reported"
+
+
+def test_a_migration_still_gets_the_keys_it_reads():
+    """The prune must not run before _migrate_legacy_globals, whose whole input
+    is settings the manifest stopped declaring three versions ago."""
+    reset()
+    p, store, _ = make_plugin({
+        "portals": PORTALS,
+        "stb_device_id": "a" * 64,
+    })
+    try:
+        with stubbed():
+            run(p, "apply_profile", store["settings"])
+    finally:
+        store["restore"]()
+
+    assert "stb_device_id" not in store["settings"], "the legacy key is gone"
+    assert "device_id=" + "a" * 64 in registry.load_registry(), (
+        "and was folded onto the portal line before being dropped"
+    )
+
+
 # -- what run() does around a handler -----------------------------------------
 
 def test_an_action_records_what_it_did():
