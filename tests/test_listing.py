@@ -422,6 +422,16 @@ def test_the_paged_request_says_the_same_thing_several_ways():
 REFUSED = s.PortalError("portal returned an empty channel list (check the MAC address)")
 
 
+def test_a_channel_repeated_in_one_response_is_still_one_channel():
+    """Dispatcharr hashes a stream partly on its URL, so a duplicate row is a
+    second stream for one channel rather than a harmless extra line."""
+    p = portal()
+    p._get_json = lambda q, with_auth=True: {"js": {"data": [
+        row(id="1"), row(id="2", name="Two"), row(id="1"),
+    ]}}
+    assert [c.channel_id for c in p.get_all_channels()] == ["1", "2"]
+
+
 def test_a_portal_that_answers_in_one_request_is_never_paged():
     p = scripted({"js": {"data": [row()]}}, {})
     assert len(p.list_channels()) == 1

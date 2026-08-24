@@ -584,10 +584,31 @@ _EXPIRY_FORMATS = (
 
 
 def parse_expiry(value: Any) -> Optional[datetime]:
-    """Read a subscription expiry out of a free-text portal field."""
+    """Read a subscription expiry out of whatever field carried it.
+
+    Two shapes, because the two places it is found do not agree. get_main_info
+    holds free text a reseller typed; the profile's own account_info block
+    holds a Unix timestamp, which is also how a portal writes "never" -- 0 and
+    -1 both mean no expiry, and reading either as a date would report every
+    unlimited account as having run out in 1970.
+    """
     text = str(value or "").strip()
     if not text or text.startswith("0000-00-00"):
         return None
+
+    if re.fullmatch(r"-?\d+", text):
+        seconds = int(text)
+        if seconds <= 0:
+            return None
+        # Past the year 3000 in seconds is a value that was meant as
+        # milliseconds; portals send both.
+        if seconds > 32503680000:
+            seconds //= 1000
+        try:
+            return datetime.fromtimestamp(seconds, timezone.utc)
+        except (OverflowError, OSError, ValueError):
+            return None
+
     for fmt in _EXPIRY_FORMATS:
         try:
             return datetime.strptime(text, fmt).replace(tzinfo=timezone.utc)
@@ -611,6 +632,27 @@ def prehash(mac: str) -> str:
     shared by every user of one client is the version that fails.
     """
     return hashlib.sha1(mac.upper().encode("utf-8")).hexdigest().upper()
+
+
+# Portals put markup in the sentence they refuse with -- "Your STB is
+# damaged.<br/> Call the provider." is a stock one -- and it lands in a
+# Dispatcharr notification, where a tag is noise at best.
+_MARKUP = re.compile(r"<[^>]*>")
+
+# Phrasings for the one refusal a user can act on: the portal has this MAC
+# bound to a device id that is not the one being sent. Kept to the binding
+# itself, because 'device' alone turns up in refusals with no remedy at all
+# ("device limit reached"), and labelling one of those would hand the user a
+# fix that cannot work. Safe as a phrase set where the raw-body patterns are
+# not: this is a field the middleware wrote, not an arbitrary document.
+DEVICE_CONFLICT = (
+    re.compile(r"device\s*conflict", re.I),
+    re.compile(
+        r"device[\s_-]?id[^.!?]{0,40}?"
+        r"(mismatch|conflict|does\s*not\s*match|not\s*match)",
+        re.I,
+    ),
+)
 
 
 def normalize_mac(mac: str) -> str:
@@ -1795,12 +1837,28 @@ class Portal:
         """The portal's own explanation, if it gave one.
 
         ``block_msg`` first: when both are set it is the specific one, and it
-        is what the reseller wrote for exactly this situation.
+        is what the reseller wrote for exactly this situation. Markup comes out
+        of it, because this ends up in a Dispatcharr notification and portals
+        write these with ``<br/>`` in them.
+
+        A device conflict gets a sentence added. It is the one refusal here
+        that the user can do something about, and the portal's own wording for
+        it names the device rather than the binding -- so the message arrives
+        describing a problem with the box instead of one with two settings on
+        the portal line.
         """
         for key in ("block_msg", "msg"):
-            value = str(profile.get(key) or "").strip()
-            if value:
-                return value
+            value = " ".join(_MARKUP.sub(" ", str(profile.get(key) or "")).split())
+            if not value:
+                continue
+            if any(pattern.search(value) for pattern in DEVICE_CONFLICT):
+                value += (
+                    " -- the portal has this MAC bound to a different device "
+                    "id; put the ones it expects on the portal line with "
+                    "'device_id=' and 'device_id2=', or ask the provider to "
+                    "clear the binding"
+                )
+            return value
         return ""
 
     def account_snapshot(self) -> Dict[str, Any]:
@@ -1830,14 +1888,30 @@ class Portal:
         """
         snapshot: Dict[str, Any] = {"expires": None, "blocked": False}
 
-        try:
-            js = self._get_json(
-                "type=account_info&action=get_main_info&JsHttpRequest=1-xml"
-            ).get("js")
-            if isinstance(js, dict):
-                snapshot["expires"] = parse_expiry(js.get("phone"))
-        except Exception:
-            pass
+        # The profile login() already read comes first, and costs nothing:
+        # 'account_info' is where Ministra itself puts the date, as a Unix
+        # timestamp. A portal that answered there is not asked again.
+        info = self.profile.get("account_info")
+        if isinstance(info, dict):
+            snapshot["expires"] = parse_expiry(info.get("expire_date"))
+
+        if snapshot["expires"] is None:
+            try:
+                js = self._get_json(
+                    "type=account_info&action=get_main_info&JsHttpRequest=1-xml"
+                ).get("js")
+                if isinstance(js, dict):
+                    # 'phone' last: it is where the date ends up on the portals
+                    # this plugin actually meets, but it is a free-text field
+                    # and the three named ones mean only this when present.
+                    for field in ("expire_date", "end_date",
+                                  "expire_billing_date", "phone"):
+                        found = parse_expiry(js.get(field))
+                        if found:
+                            snapshot["expires"] = found
+                            break
+            except Exception:
+                pass
 
         snapshot["blocked"] = str(self.profile.get("blocked") or "0") not in ("0", "")
 
@@ -1882,10 +1956,21 @@ class Portal:
             )
 
         channels: List[ChannelEntry] = []
+        seen = set()
         for row in rows:
             channel = self._channel_from_row(row)
-            if channel is not None:
-                channels.append(channel)
+            if channel is None:
+                continue
+            # Portals do repeat a channel in this response, and a duplicate is
+            # not a harmless extra row: Dispatcharr hashes a stream partly on
+            # its URL, so it becomes a second stream for one channel. Keyed the
+            # way the paged path keys it -- the id when there is one, the
+            # command when there is not.
+            key = channel.channel_id or channel.cmd
+            if key in seen:
+                continue
+            seen.add(key)
+            channels.append(channel)
         return channels
 
     @staticmethod

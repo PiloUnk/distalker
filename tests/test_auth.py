@@ -121,6 +121,49 @@ def test_the_portal_gets_the_last_word_on_why():
         raise AssertionError("status 1 must refuse the session")
 
 
+def test_the_refusal_arrives_without_the_markup_it_was_written_in():
+    """It lands in a Dispatcharr notification, where a <br/> is noise."""
+    p = portal({
+        "handshake": HANDSHAKE,
+        "get_profile": {"js": {"status": 1,
+                               "block_msg": "Subscription expired.<br/> Call us."}},
+    })
+    try:
+        p.login()
+    except s.PortalAuthError as exc:
+        assert str(exc) == "Subscription expired. Call us.", exc
+    else:
+        raise AssertionError("status 1 must refuse the session")
+
+
+def test_a_bound_mac_is_named_as_the_settings_that_fix_it():
+    """The one refusal here a user can act on, and the portal misnames it.
+
+    Its own wording points at the box; the problem is two values on the portal
+    line. Kept to the binding itself -- 'device limit reached' has no remedy,
+    and offering one would be worse than saying nothing.
+    """
+    p = portal({
+        "handshake": HANDSHAKE,
+        "get_profile": {"js": {"status": 1, "msg": "device id mismatch"}},
+    })
+    try:
+        p.login()
+    except s.PortalAuthError as exc:
+        assert "device_id2=" in str(exc), exc
+    else:
+        raise AssertionError("status 1 must refuse the session")
+
+    plain = portal({
+        "handshake": HANDSHAKE,
+        "get_profile": {"js": {"status": 1, "msg": "device limit reached"}},
+    })
+    try:
+        plain.login()
+    except s.PortalAuthError as exc:
+        assert str(exc) == "device limit reached", exc
+
+
 def test_a_second_step_that_still_fails_is_refused():
     p = portal(
         {"handshake": HANDSHAKE,

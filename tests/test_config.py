@@ -271,6 +271,20 @@ def test_expiry_is_read_from_the_field_resellers_use():
     assert s.parse_expiry(None) is None
 
 
+def test_expiry_is_also_read_from_the_field_ministra_uses():
+    """account_info holds a Unix timestamp, and it is free: login() read it.
+
+    It is also where a portal writes 'never', as 0 or -1. Read as a date, an
+    unlimited account would be reported as having run out in 1970 -- which is
+    the one wrong answer worse than no answer at all.
+    """
+    assert s.parse_expiry(1785000000).year == 2026
+    # Portals send the same value in milliseconds, and mean the same date.
+    assert s.parse_expiry("1785000000000") == s.parse_expiry("1785000000")
+    for unlimited in (0, "0", -1, "-1"):
+        assert s.parse_expiry(unlimited) is None, unlimited
+
+
 def test_the_default_arguments_let_dispatcharr_fail_over():
     """ffmpeg must not reconnect on its own: it retries an expired portal link
     while staying alive, so Dispatcharr sees no failure and never switches to
