@@ -384,6 +384,22 @@ def page(ids, **extra):
     return js
 
 
+def test_the_paged_request_says_the_same_thing_several_ways():
+    """Belt and braces, as with the identity in _common_params.
+
+    A Ministra portal reads 'genre' and ignores the rest. The clones do not all
+    read the same one, and every parameter here is one that some other client
+    found a portal wanting -- sending them all costs a longer query string.
+    """
+    p = portal()
+    seen = []
+    p._get_json = lambda q, with_auth=True: seen.append(q) or {"js": {"data": []}}
+    p.get_ordered_list(3)
+    for expected in ("genre=*", "category=*", "fav=0", "force_ch_link_check=",
+                     "hd=0", "sortby=number", "p=3"):
+        assert expected in seen[0], f"{expected} missing from {seen[0]}"
+
+
 REFUSED = s.PortalError("portal returned an empty channel list (check the MAC address)")
 
 

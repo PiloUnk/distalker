@@ -19,6 +19,7 @@ The protocol implementation is a Python reimplementation informed by stalkerhek
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -567,6 +568,23 @@ def parse_expiry(value: Any) -> Optional[datetime]:
         except ValueError:
             continue
     return None
+
+
+def prehash(mac: str) -> str:
+    """The SHA1 a client presents itself with, derived from the MAC it uses.
+
+    Neither the stock middleware nor any portal met so far reads this. It is
+    there for the optional access_filter.php a reseller can install in front of
+    it, which is also the reason a box that sends nothing at all is the shape
+    some of those filters reject.
+
+    What to send is written down nowhere. iptvnator computes the SHA1 of the
+    upper-case MAC; QiTV ships one constant for every install it has ever run.
+    Only the first says something true about this box, so it is the one copied
+    here -- and if a portal ever checks it against its own record, a constant
+    shared by every user of one client is the version that fails.
+    """
+    return hashlib.sha1(mac.upper().encode("utf-8")).hexdigest().upper()
 
 
 def normalize_mac(mac: str) -> str:
@@ -1363,6 +1381,10 @@ class Portal:
         # Whether the portal said the token it handed back is already good for
         # more than the handshake. Reported straight back to it in get_profile.
         self.valid_token = False
+        # The nonce the handshake handed back, echoed in get_profile's metrics.
+        # A portal that issues one and never sees it again is being talked to
+        # by something that did not read its own handshake.
+        self.handshake_random = ""
         # What get_profile answered during login(), kept so nothing has to ask
         # twice: the expiry report and the blocked flag both read it.
         self.profile: Dict[str, Any] = {}
@@ -1494,12 +1516,14 @@ class Portal:
     def handshake(self) -> str:
         """Reserve a token. The portal may hand back a different one."""
         data = self._get_json(
-            f"type=stb&action=handshake&token={self.token}&JsHttpRequest=1-xml",
+            f"type=stb&action=handshake&token={self.token}"
+            f"&prehash={prehash(self.cfg.mac)}&JsHttpRequest=1-xml",
             with_auth=False,
         )
         js = data.get("js") if isinstance(data, dict) else None
         if isinstance(js, dict) and js.get("token"):
             self.token = str(js["token"])
+            self.handshake_random = str(js.get("random") or "")
             # 'not_valid' is the portal saying the token still has to be
             # earned. get_profile is told the same thing back, which is how it
             # knows whether it is being asked to validate or merely to report.
@@ -1558,12 +1582,35 @@ class Portal:
             f"&device_id={quote(self.cfg.device_id)}"
             f"&device_id2={quote(self.cfg.device_id2)}"
             f"&signature={quote(self.cfg.signature)}"
+            f"&client_type=STB&video_out=hdmi"
+            f"&metrics={quote(self._metrics())}"
+            f"&prehash={prehash(self.cfg.mac)}"
             f"&not_valid_token={0 if self.valid_token else 1}"
             f"&auth_second_step={1 if auth_second_step else 0}"
         )
         data = self._get_json(query)
         js = data.get("js") if isinstance(data, dict) else None
         return js if isinstance(js, dict) else {}
+
+    def _metrics(self) -> str:
+        """The box describing itself, in the shape get_profile wants it.
+
+        A JSON blob rather than parameters, which is Ministra's choice and not
+        ours. It is what the admin panel stores and shows the reseller, so a
+        portal whose operator looks at their device list sees a MAG rather than
+        a blank row -- and the filters that reject a box reporting nothing read
+        this too.
+        """
+        return json.dumps(
+            {
+                "mac": self.cfg.mac,
+                "sn": self.cfg.serial_number,
+                "model": self.cfg.model,
+                "type": "STB",
+                "random": self.handshake_random,
+            },
+            separators=(",", ":"),
+        )
 
     # What get_profile's 'status' means. The portal decides which authentication
     # this account needs and says so here, rather than the client guessing from
@@ -1827,7 +1874,14 @@ class Portal:
         """
         data = self._get_json(
             "type=itv&action=get_ordered_list&JsHttpRequest=1-xml"
-            f"&genre=*&fav=0&sortby=number&p={int(page)}"
+            # 'category' says the same thing as 'genre' to the portals that
+            # read that one instead, 'force_ch_link_check' is sent empty by
+            # every client that sends it at all, and 'hd' asks for the whole
+            # line-up rather than the HD half of it. None of the three changes
+            # what a Ministra portal answers; each of them is what one of the
+            # other clients found a portal that wanted it.
+            f"&genre=*&category=*&fav=0&force_ch_link_check=&hd=0"
+            f"&sortby=number&p={int(page)}"
         )
         js = data.get("js") if isinstance(data, dict) else None
         return js if isinstance(js, dict) else {}

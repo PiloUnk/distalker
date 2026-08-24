@@ -184,8 +184,45 @@ def test_the_whole_stb_identity_is_sent():
     p.login()
     query = [q for q in p.queries if "action=get_profile" in q][0]
     for expected in ("signature=" + "a" * 64, "sn=SN1", "stb_type=MAG322",
-                     "num_banks=1", "image_version=216", "hd=1", "ver=", "hw_version="):
+                     "num_banks=1", "image_version=216", "hd=1", "ver=", "hw_version=",
+                     # The two other clients send these and this one did not.
+                     # Harmless to a portal that ignores them, and the shape a
+                     # reseller's access filter looks for in one that does not.
+                     "client_type=STB", "video_out=hdmi"):
         assert expected in query, f"{expected} missing from {query}"
+
+
+def test_the_box_is_described_where_the_admin_panel_reads_it():
+    """'metrics' is what a portal stores and shows its operator.
+
+    Echoing the handshake's nonce back inside it is the part a portal could
+    actually check: it issued that value one request ago, and only something
+    that read the answer can quote it.
+    """
+    p = portal({"handshake": {"js": {"token": "TOK", "random": "R1"}},
+                "get_profile": {"js": {"status": 0}}},
+               serial_number="SN1", model="MAG322")
+    p.login()
+    query = [q for q in p.queries if "action=get_profile" in q][0]
+    for expected in ("%22random%22%3A%22R1%22", "%22model%22%3A%22MAG322%22",
+                     "%22sn%22%3A%22SN1%22", "%22type%22%3A%22STB%22"):
+        assert expected in query, f"{expected} missing from {query}"
+
+
+def test_the_prehash_is_this_box_rather_than_every_box():
+    """A constant shared by every user of one client is the version that fails.
+
+    Nothing in Ministra reads it; an access_filter.php in front of it can, and
+    that is the whole reason to send one at all.
+    """
+    p = portal({"handshake": HANDSHAKE, "get_profile": {"js": {"status": 0}}})
+    p.login()
+    expected = "prehash=" + s.prehash("00:1A:79:AA:BB:CC")
+    assert any(expected in q for q in p.queries if "action=handshake" in q), p.queries
+    assert any(expected in q for q in p.queries if "action=get_profile" in q), p.queries
+    # The MAC, not the box, and not case-sensitive about how it was written.
+    assert s.prehash("00:1a:79:aa:bb:cc") == s.prehash("00:1A:79:AA:BB:CC")
+    assert len(s.prehash("00:1A:79:AA:BB:CC")) == 40
 
 
 def test_a_dead_session_in_plain_text_is_an_auth_error():
